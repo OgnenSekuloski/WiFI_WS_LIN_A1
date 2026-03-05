@@ -166,6 +166,9 @@ static char http_wifi_connect_response[WIFI_CONNECT_RESPONSE_LENGTH] = {0};
 /* Array to store Wi-Fi scan response. */
 static char http_scan_response[MAX_WIFI_SCAN_HTTP_RESPONSE_LENGTH] = {0};
 
+/* True when provisioning button GPIO is initialized and safe to read. */
+static bool provisioning_button_enabled = false;
+
 /*******************************************************************************
  * Function Name: process_sse_handler
  *******************************************************************************
@@ -537,9 +540,11 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
         ERR_INFO(("Failed to send the HTTP POST response.\n"));
     }
 
+    APP_INFO(("Exiting provisioning/AP mode.\r\n"));
     result = start_sta_mode();
     if (CY_RSLT_SUCCESS != result)
     {
+        ERR_INFO(("Wi-Fi connection failure and fallback to provisioning/AP mode.\r\n"));
         sprintf(response, WIFI_CONNECT_RESPONSE_START);
         response += strlen(WIFI_CONNECT_RESPONSE_START);
         sprintf(response, WIFI_CONNECT_FAIL_RESPONSE_END);
@@ -657,6 +662,8 @@ cy_rslt_t start_sta_mode()
     cy_wcm_ip_address_t ip_address;
     bool wifi_conct_stat = false;
 
+    APP_INFO(("Entering STA mode.\r\n"));
+
     /*Disconnect from the currently connected AP if any*/
     wifi_conct_stat = cy_wcm_is_connected_to_ap();
     if(wifi_conct_stat)
@@ -679,10 +686,10 @@ cy_rslt_t start_sta_mode()
         result = cy_wcm_connect_ap(&connect_param, &ip_address);
         if (result == CY_RSLT_SUCCESS)
         {
-            APP_INFO(("Successfully connected to Wi-Fi network '%s'.\n", connect_param.ap_credentials.SSID));
+            APP_INFO(("Successful Wi-Fi connection: '%s'.\r\n", connect_param.ap_credentials.SSID));
             break;
         }
-        ERR_INFO(("Connection to Wi-Fi network failed with error code %d. Retrying in %d ms...\n", (int)result, WIFI_CONN_RETRY_INTERVAL_MSEC));
+        ERR_INFO(("Wi-Fi connection attempt failed (error %d). Retrying in %d ms...\r\n", (int)result, WIFI_CONN_RETRY_INTERVAL_MSEC));
 
         vTaskDelay(pdMS_TO_TICKS(WIFI_CONN_RETRY_INTERVAL_MSEC));
     }
@@ -858,6 +865,9 @@ cy_rslt_t reconfigure_http_server(void)
     /* Holds the response handler for dynamic SSE resource. */
     cy_resource_dynamic_data_t dynamic_sse_resource;
 
+    APP_INFO(("Exiting provisioning/AP mode.\r\n"));
+    APP_INFO(("Entering STA mode.\r\n"));
+
     /* Restart HTTP server using the new ip address. */
     result = cy_http_server_stop( http_ap_server );
     PRINT_AND_ASSERT(result, "Failed to stop HTTP server.\n");
@@ -1003,9 +1013,34 @@ void url_decode(char *dst, const uint8_t *src)
 *******************************************************************************/
 static void provisioning_button_init(void)
 {
-    /* User buttons on PSoC kits are typically active-low with pull-up. */
-    cyhal_gpio_init(CYBSP_USER_BTN, CYHAL_GPIO_DIR_INPUT,
-                    CYHAL_GPIO_DRIVE_PULLUP, 1u);
+    cy_rslt_t result;
+    uint8_t inactive_state = (PROVISION_BUTTON_ACTIVE_STATE == 0u) ? 1u : 0u;
+
+    /* User button must be input + pull-up for active-low long-press detection. */
+    result = cyhal_gpio_init(PROVISION_FORCE_BUTTON, CYHAL_GPIO_DIR_INPUT,
+                             CYHAL_GPIO_DRIVE_PULLUP, inactive_state);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        ERR_INFO(("Provisioning button init failed (0x%08lx). Retrying after free.\r\n",
+                  (unsigned long)result));
+        cyhal_gpio_free(PROVISION_FORCE_BUTTON);
+        result = cyhal_gpio_init(PROVISION_FORCE_BUTTON, CYHAL_GPIO_DIR_INPUT,
+                                 CYHAL_GPIO_DRIVE_PULLUP, inactive_state);
+    }
+
+    if (result == CY_RSLT_SUCCESS)
+    {
+        provisioning_button_enabled = true;
+        APP_INFO(("Provisioning button configured: input/pull-up, active state=%lu.\r\n",
+                  (unsigned long)PROVISION_BUTTON_ACTIVE_STATE));
+    }
+    else
+    {
+        provisioning_button_enabled = false;
+        ERR_INFO(("Failed to initialize provisioning button GPIO (0x%08lx). "
+                  "Runtime force-provisioning via button is disabled.\r\n",
+                  (unsigned long)result));
+    }
 }
 
 /*******************************************************************************
@@ -1025,6 +1060,8 @@ static void provisioning_button_init(void)
 static cy_rslt_t start_provisioning_softap(void)
 {
     cy_rslt_t result;
+
+    APP_INFO(("Entering provisioning/AP mode.\r\n"));
 
     /* Reset provisioning state variables */
     device_configured = false;
@@ -1086,7 +1123,13 @@ static void stop_sta_http_server(void)
 *******************************************************************************/
 static void switch_to_provisioning_mode(void)
 {
-    APP_INFO(("Runtime request: switching to provisioning mode...\r\n"));
+    APP_INFO(("Entering provisioning/AP mode.\r\n"));
+
+    if (reconfiguration_request == 0)
+    {
+        APP_INFO(("Already in provisioning/AP mode.\r\n"));
+        return;
+    }
 
     /* Stop STA HTTP server (if running) */
     if (reconfiguration_request == SERVER_RECONFIGURED)
@@ -1121,23 +1164,60 @@ static void switch_to_provisioning_mode(void)
 *******************************************************************************/
 static void handle_runtime_force_provisioning(uint32_t loop_period_ms)
 {
+    static bool stable_pressed = false;
+    static bool last_raw_pressed = false;
+    static bool long_press_handled = false;
+    static uint32_t debounce_ms = 0;
     static uint32_t pressed_ms = 0;
 
-    bool pressed = (cyhal_gpio_read(CYBSP_USER_BTN) == 0u); /* active-low */
-
-    if (pressed)
+    if (!provisioning_button_enabled)
     {
-        pressed_ms += loop_period_ms;
+        return;
+    }
+
+    bool raw_pressed = (cyhal_gpio_read(PROVISION_FORCE_BUTTON) == PROVISION_BUTTON_ACTIVE_STATE);
+
+    if (raw_pressed != last_raw_pressed)
+    {
+        last_raw_pressed = raw_pressed;
+        debounce_ms = 0;
+    }
+    else if (debounce_ms < PROVISION_BUTTON_DEBOUNCE_MS)
+    {
+        debounce_ms += loop_period_ms;
+    }
+
+    if ((debounce_ms >= PROVISION_BUTTON_DEBOUNCE_MS) && (stable_pressed != raw_pressed))
+    {
+        stable_pressed = raw_pressed;
+
+        if (stable_pressed)
+        {
+            APP_INFO(("Button press detected.\r\n"));
+            pressed_ms = 0;
+            long_press_handled = false;
+        }
+        else
+        {
+            APP_INFO(("Button released.\r\n"));
+            pressed_ms = 0;
+            long_press_handled = false;
+        }
+    }
+
+    if (stable_pressed && (!long_press_handled))
+    {
+        if (pressed_ms < PROVISION_LONG_PRESS_MS)
+        {
+            pressed_ms += loop_period_ms;
+        }
 
         if (pressed_ms >= PROVISION_LONG_PRESS_MS)
         {
-            pressed_ms = 0;
+            APP_INFO(("Long press detected.\r\n"));
+            long_press_handled = true;
             switch_to_provisioning_mode();
         }
-    }
-    else
-    {
-        pressed_ms = 0;
     }
 }
 
@@ -1239,6 +1319,7 @@ void server_task(void *arg)
 
     if (!connected)
     {
+        ERR_INFO(("Wi-Fi connection failure and fallback to provisioning/AP mode.\r\n"));
         APP_INFO(("Boot: no known network connected. Starting provisioning SoftAP...\r\n"));
         result = start_provisioning_softap();
         PRINT_AND_ASSERT(result, "start_provisioning_softap failed.\n");
@@ -1249,6 +1330,11 @@ void server_task(void *arg)
     /* Waits for queue message to register a new HTTP page resource.*/
     while (true)
     {
+        /**********************************************************************
+         * Runtime long-press check in all modes (AP provisioning + STA).
+         *********************************************************************/
+        handle_runtime_force_provisioning(SERVER_LOOP_PERIOD_MS);
+
         if(SERVER_RECONFIGURED == reconfiguration_request)
         {
             /* Process all widgets */
@@ -1327,12 +1413,6 @@ void server_task(void *arg)
             }
         }
 
-            /******************************************************************
-             * Phase 1: Runtime long-press switches back to provisioning mode
-             ******************************************************************/
-            handle_runtime_force_provisioning(SERVER_LOOP_PERIOD_MS);
-
-            vTaskDelay(pdMS_TO_TICKS(SERVER_LOOP_PERIOD_MS));
         }
 
         if(SERVER_RECONFIGURE_REQUESTED == reconfiguration_request)
@@ -1342,6 +1422,8 @@ void server_task(void *arg)
             initialize_sensors();
             reconfiguration_request = SERVER_RECONFIGURED;
         }
+
+        vTaskDelay(pdMS_TO_TICKS(SERVER_LOOP_PERIOD_MS));
 
     }
 
