@@ -127,8 +127,8 @@
 #define SOFTAP_NETMASK                               MAKE_IPV4_ADDRESS(255, 255, 255, 0)
 #define SOFTAP_GATEWAY                               MAKE_IPV4_ADDRESS(192, 168, 0,  2)
 
-#define MAX_WIFI_RETRY_COUNT                         (3u)
-#define WIFI_CONN_RETRY_INTERVAL_MSEC                (100u)
+#define MAX_WIFI_RETRY_COUNT                         (6u)
+#define WIFI_CONN_RETRY_INTERVAL_MSEC                (250u)
 
 /* HTTP headers used in response to client */
 #define HTTP_HEADER_204                              "HTTP/1.1 204 No Content"

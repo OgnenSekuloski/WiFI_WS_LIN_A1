@@ -179,10 +179,28 @@ static volatile bool provisioning_button_force_mode_requested = false;
 static cyhal_gpio_event_t provisioning_button_press_event = CYHAL_GPIO_IRQ_FALL;
 static cyhal_gpio_event_t provisioning_button_release_event = CYHAL_GPIO_IRQ_RISE;
 
+/* Known join failure observed from WHD when authentication/credentials are invalid. */
+#define WIFI_JOIN_AUTH_FAILURE_RSLT                  (33555456u)
+#define WIFI_CONN_BACKOFF_MAX_MSEC                   (5000u)
+
+typedef enum
+{
+    WIFI_FAIL_REASON_NONE = 0,
+    WIFI_FAIL_REASON_BUTTON_ABORT,
+    WIFI_FAIL_REASON_AUTH_CREDENTIALS,
+    WIFI_FAIL_REASON_CONNECT_TIMEOUT,
+    WIFI_FAIL_REASON_AP_UNREACHABLE,
+    WIFI_FAIL_REASON_UNKNOWN
+} wifi_fail_reason_t;
+
+static volatile wifi_fail_reason_t last_wifi_fail_reason = WIFI_FAIL_REASON_NONE;
+
 /* Forward declarations for runtime button/provisioning control. */
 static void handle_runtime_force_provisioning(uint32_t loop_period_ms);
 static bool is_provisioning_ap_active(void);
 static void provisioning_button_isr_callback(void *callback_arg, cyhal_gpio_event_t event);
+static wifi_fail_reason_t classify_wifi_connect_failure(cy_rslt_t result_code);
+static const char* wifi_fail_reason_to_text(wifi_fail_reason_t reason);
 
 static cyhal_gpio_callback_data_t provisioning_button_cb_data =
 {
@@ -223,6 +241,53 @@ static void provisioning_button_isr_callback(void *callback_arg, cyhal_gpio_even
     {
         provisioning_button_irq_is_pressed = false;
         provisioning_button_irq_released = true;
+    }
+}
+
+/*******************************************************************************
+* Function Name: classify_wifi_connect_failure
+********************************************************************************
+* Summary:
+*  Maps low-level Wi-Fi connect result code to a higher-level failure reason.
+*******************************************************************************/
+static wifi_fail_reason_t classify_wifi_connect_failure(cy_rslt_t result_code)
+{
+    if (result_code == CY_RSLT_SUCCESS)
+    {
+        return WIFI_FAIL_REASON_NONE;
+    }
+
+    if ((uint32_t)result_code == WIFI_JOIN_AUTH_FAILURE_RSLT)
+    {
+        return WIFI_FAIL_REASON_AUTH_CREDENTIALS;
+    }
+
+    /* Fallback bucket when AP may be unavailable / weak signal / transient issue. */
+    return WIFI_FAIL_REASON_AP_UNREACHABLE;
+}
+
+/*******************************************************************************
+* Function Name: wifi_fail_reason_to_text
+********************************************************************************
+* Summary:
+*  Returns a short, printable label for failure reason telemetry/logging.
+*******************************************************************************/
+static const char* wifi_fail_reason_to_text(wifi_fail_reason_t reason)
+{
+    switch (reason)
+    {
+        case WIFI_FAIL_REASON_NONE:
+            return "none";
+        case WIFI_FAIL_REASON_BUTTON_ABORT:
+            return "button_abort";
+        case WIFI_FAIL_REASON_AUTH_CREDENTIALS:
+            return "auth_or_credentials";
+        case WIFI_FAIL_REASON_CONNECT_TIMEOUT:
+            return "connect_timeout";
+        case WIFI_FAIL_REASON_AP_UNREACHABLE:
+            return "ap_unreachable_or_transient";
+        default:
+            return "unknown";
     }
 }
 
@@ -623,9 +688,14 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
             APP_INFO(("Wi-Fi connect canceled by button request; staying in provisioning/AP mode.\r\n"));
             provisioning_button_force_mode_requested = false;
         }
+        else if (last_wifi_fail_reason == WIFI_FAIL_REASON_AUTH_CREDENTIALS)
+        {
+            ERR_INFO(("Wi-Fi authentication failed. Check SSID/password and retry provisioning.\r\n"));
+        }
         else
         {
-            ERR_INFO(("Wi-Fi connection failure and fallback to provisioning/AP mode.\r\n"));
+            ERR_INFO(("Wi-Fi connection failure (%s) and fallback to provisioning/AP mode.\r\n",
+                      wifi_fail_reason_to_text(last_wifi_fail_reason)));
         }
         sprintf(response, WIFI_CONNECT_RESPONSE_START);
         response += strlen(WIFI_CONNECT_RESPONSE_START);
@@ -739,13 +809,15 @@ cy_rslt_t start_ap_mode()
  *******************************************************************************/
 cy_rslt_t start_sta_mode()
 {
-    cy_rslt_t result;
+    cy_rslt_t result = CY_RSLT_TYPE_ERROR;
     cy_wcm_connect_params_t connect_param;
     cy_wcm_ip_address_t ip_address;
     bool wifi_conct_stat = false;
+    uint32_t retry_delay_ms = WIFI_CONN_RETRY_INTERVAL_MSEC;
 
     APP_INFO(("Entering STA mode.\r\n"));
     provisioning_button_force_mode_requested = false;
+    last_wifi_fail_reason = WIFI_FAIL_REASON_NONE;
 
     /*Disconnect from the currently connected AP if any*/
     wifi_conct_stat = cy_wcm_is_connected_to_ap();
@@ -766,11 +838,12 @@ cy_rslt_t start_sta_mode()
      */
     for (uint32_t conn_retries = 0; conn_retries < MAX_WIFI_RETRY_COUNT; conn_retries++)
     {
-        /* Allow long-press to interrupt STA connect attempts at any point. */
+        /* Allow provisioning button to interrupt STA connect attempts at any point. */
         handle_runtime_force_provisioning(SERVER_LOOP_PERIOD_MS);
         if (provisioning_button_force_mode_requested)
         {
             APP_INFO(("Wi-Fi connect aborted by button request; entering provisioning/AP mode.\r\n"));
+            last_wifi_fail_reason = WIFI_FAIL_REASON_BUTTON_ABORT;
             return CY_RSLT_TYPE_ERROR;
         }
 
@@ -778,16 +851,30 @@ cy_rslt_t start_sta_mode()
         if (result == CY_RSLT_SUCCESS)
         {
             APP_INFO(("Successful Wi-Fi connection: '%s'.\r\n", connect_param.ap_credentials.SSID));
+            last_wifi_fail_reason = WIFI_FAIL_REASON_NONE;
             break;
         }
-        ERR_INFO(("Wi-Fi connection attempt failed (error %d). Retrying in %d ms...\r\n", (int)result, WIFI_CONN_RETRY_INTERVAL_MSEC));
+        last_wifi_fail_reason = classify_wifi_connect_failure(result);
+        ERR_INFO(("Wi-Fi connection attempt %lu/%lu failed (error %ld, reason=%s). Retrying in %lu ms...\r\n",
+                  (unsigned long)(conn_retries + 1u),
+                  (unsigned long)MAX_WIFI_RETRY_COUNT,
+                  (long)result,
+                  wifi_fail_reason_to_text(last_wifi_fail_reason),
+                  (unsigned long)retry_delay_ms));
+
+        /* Invalid credentials typically do not recover with retries; fail over quickly. */
+        if (last_wifi_fail_reason == WIFI_FAIL_REASON_AUTH_CREDENTIALS)
+        {
+            break;
+        }
+
         uint32_t wait_ms = 0;
-        while (wait_ms < WIFI_CONN_RETRY_INTERVAL_MSEC)
+        while (wait_ms < retry_delay_ms)
         {
             uint32_t slice_ms = SERVER_LOOP_PERIOD_MS;
-            if ((WIFI_CONN_RETRY_INTERVAL_MSEC - wait_ms) < slice_ms)
+            if ((retry_delay_ms - wait_ms) < slice_ms)
             {
-                slice_ms = WIFI_CONN_RETRY_INTERVAL_MSEC - wait_ms;
+                slice_ms = retry_delay_ms - wait_ms;
             }
 
             vTaskDelay(pdMS_TO_TICKS(slice_ms));
@@ -797,7 +884,17 @@ cy_rslt_t start_sta_mode()
             if (provisioning_button_force_mode_requested)
             {
                 APP_INFO(("Wi-Fi connect aborted by button request; entering provisioning/AP mode.\r\n"));
+                last_wifi_fail_reason = WIFI_FAIL_REASON_BUTTON_ABORT;
                 return CY_RSLT_TYPE_ERROR;
+            }
+        }
+
+        if (retry_delay_ms < WIFI_CONN_BACKOFF_MAX_MSEC)
+        {
+            retry_delay_ms <<= 1u;
+            if (retry_delay_ms > WIFI_CONN_BACKOFF_MAX_MSEC)
+            {
+                retry_delay_ms = WIFI_CONN_BACKOFF_MAX_MSEC;
             }
         }
     }
@@ -1469,7 +1566,8 @@ void server_task(void *arg)
         }
         else
         {
-            ERR_INFO(("Wi-Fi connection failure and fallback to provisioning/AP mode.\r\n"));
+            ERR_INFO(("Wi-Fi connection failure (%s) and fallback to provisioning/AP mode.\r\n",
+                      wifi_fail_reason_to_text(last_wifi_fail_reason)));
             APP_INFO(("Boot: no known network connected. Starting provisioning SoftAP...\r\n"));
             result = start_provisioning_softap();
             PRINT_AND_ASSERT(result, "start_provisioning_softap failed.\n");
