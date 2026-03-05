@@ -120,6 +120,13 @@ GROUP(libgcc.a libc.a libm.a libnosys.a)
 
 SECTIONS
 {
+    /**********************************************************************
+     * Wi-Fi credentials store area (internal flash).
+     * We anchor it at the start of em_eeprom region.
+     **********************************************************************/
+    PROVIDE(__wifi_creds_flash_start = ORIGIN(em_eeprom));
+    PROVIDE(__wifi_creds_flash_end   = ORIGIN(em_eeprom) + LENGTH(em_eeprom));
+
      /* Cortex-M0+ application flash image area */
     .cy_m0p_image ORIGIN(flash) + BOOT_HEADER_SIZE :
     {
@@ -357,5 +364,7 @@ SECTIONS
     } > xip
 
 }
+
+PROVIDE(__wifi_creds_flash_start = ORIGIN(em_eeprom));
 
 /* EOF */

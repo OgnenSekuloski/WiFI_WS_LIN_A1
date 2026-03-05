@@ -69,6 +69,8 @@
 #include "html_web_page.h"
 #include "web_server.h"
 
+#include "wifi_network_store.h"
+
 /*******************************************************************************
 * Global Variables
 ********************************************************************************/
@@ -560,6 +562,23 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
             ERR_INFO(("Failed to send the HTTP POST response.\n"));
         }
 
+        /**********************************************************************
+         * Phase 1: Store Wi-Fi network into internal flash
+         **********************************************************************
+         * Summary:
+         *  Store the SSID/PWD so future boots can skip provisioning.
+         *  If storage is full, the store will evict the least recently used.
+         *********************************************************************/
+        cy_rslt_t save_r = wifi_store_save_network((const char*)wifi_ssid, (const char*)wifi_pwd);
+        if (save_r == CY_RSLT_SUCCESS)
+        {
+            APP_INFO(("Stored Wi-Fi network in internal flash.\r\n"));
+        }
+        else
+        {
+            ERR_INFO(("Failed to store Wi-Fi network (0x%08lx).\r\n", (unsigned long)save_r));
+        }
+
 #ifdef ENABLE_TFT
     row += ROW_OFFSET;
     GUI_DispStringAt("Connected to the Wi-Fi network: \r\n", 0, row);
@@ -740,6 +759,78 @@ cy_rslt_t configure_http_server(void)
 }
 
 /*******************************************************************************
+ * Function Name: configure_http_server_sta_only
+ *******************************************************************************
+ * Summary:
+ *  Creates and starts the HTTP server directly in STA mode.
+ *  Used when the device boots and successfully connects to a saved network.
+ *
+ * Parameters:
+ *  void
+ *
+ * Return:
+ *  cy_rslt_t: Returns CY_RSLT_SUCCESS if the HTTP server is configured
+ *  successfully, otherwise returns an error code.
+ *
+ *******************************************************************************/
+cy_rslt_t configure_http_server_sta_only(void)
+{
+    cy_rslt_t result = CY_RSLT_SUCCESS;
+    cy_wcm_ip_address_t ip_addr;
+
+    /* Holds the response handler for HTTP GET and POST request from the client. */
+    cy_resource_dynamic_data_t http_get_post_resource;
+
+    /* Holds the response handler for dynamic SSE resource. */
+    cy_resource_dynamic_data_t dynamic_sse_resource;
+
+    /* Get STA IP address */
+    result = cy_wcm_get_ip_addr(CY_WCM_INTERFACE_TYPE_STA, &ip_addr);
+    PRINT_AND_ASSERT(result, "cy_wcm_get_ip_addr failed for STA HTTP server.\n");
+
+    http_server_ip_address.ip_address.ip.v4 = ip_addr.ip.v4;
+    http_server_ip_address.ip_address.version = CY_SOCKET_IP_VER_V4;
+
+    /* Add IP address information to network interface object. */
+    nw_interface.object = (void *)&http_server_ip_address;
+    nw_interface.type = CY_NW_INF_TYPE_WIFI;
+
+    /* Initialize secure socket library. */
+    result = cy_http_server_network_init();
+    PRINT_AND_ASSERT(result, "cy_http_server_network_init failed.\n");
+
+    /* Create HTTP server instance for STA */
+    result = cy_http_server_create(&nw_interface, HTTP_PORT, MAX_SOCKETS, NULL, &http_sta_server);
+    PRINT_AND_ASSERT(result, "cy_http_server_create(STA) failed.\n");
+
+    /* Register SSE resource */
+    dynamic_sse_resource.resource_handler = process_sse_handler;
+    dynamic_sse_resource.arg = NULL;
+    result = cy_http_server_register_resource(http_sta_server,
+                                              (uint8_t*)"/events",
+                                              (uint8_t*)"text/event-stream",
+                                              CY_RAW_DYNAMIC_URL_CONTENT,
+                                              &dynamic_sse_resource);
+    PRINT_AND_ASSERT(result, "Failed to register /events resource.\n");
+
+    /* Root resource (same handler used in template) */
+    http_get_post_resource.resource_handler = softap_resource_handler;
+    http_get_post_resource.arg = NULL;
+    result = cy_http_server_register_resource(http_sta_server,
+                                              (uint8_t*)"/",
+                                              (uint8_t*)"text/html",
+                                              CY_DYNAMIC_URL_CONTENT,
+                                              &http_get_post_resource);
+    PRINT_AND_ASSERT(result, "Failed to register / resource.\n");
+
+    /* Start STA server */
+    result = cy_http_server_start(http_sta_server);
+    PRINT_AND_ASSERT(result, "Failed to start STA HTTP server.\n");
+
+    return result;
+}
+
+/*******************************************************************************
  * Function Name: reconfigure_http_server
  *******************************************************************************
  * Summary:
@@ -899,6 +990,158 @@ void url_decode(char *dst, const uint8_t *src)
 }
 
 /*******************************************************************************
+* Function Name: provisioning_button_init
+********************************************************************************
+* Summary:
+*  Initializes the user button used to force provisioning mode at runtime.
+*
+* Parameters:
+*  void
+*
+* Return:
+*  void
+*******************************************************************************/
+static void provisioning_button_init(void)
+{
+    /* User buttons on PSoC kits are typically active-low with pull-up. */
+    cyhal_gpio_init(CYBSP_USER_BTN, CYHAL_GPIO_DIR_INPUT,
+                    CYHAL_GPIO_DRIVE_PULLUP, 1u);
+}
+
+/*******************************************************************************
+* Function Name: start_provisioning_softap
+********************************************************************************
+* Summary:
+*  Starts SoftAP and HTTP provisioning server (AP mode).
+*  This function is used on boot fallback (no known network) and also for
+*  runtime switching back into provisioning.
+*
+* Parameters:
+*  void
+*
+* Return:
+*  cy_rslt_t: CY_RSLT_SUCCESS on success.
+*******************************************************************************/
+static cy_rslt_t start_provisioning_softap(void)
+{
+    cy_rslt_t result;
+
+    /* Reset provisioning state variables */
+    device_configured = false;
+    reconfiguration_request = 0;
+    http_event_stream = NULL;
+
+    /* Start SoftAP */
+    result = start_ap_mode();
+    PRINT_AND_ASSERT(result, "start_ap_mode failed.\n");
+
+    /* Create and start HTTP server bound to AP interface */
+    result = configure_http_server();
+    PRINT_AND_ASSERT(result, "configure_http_server failed.\n");
+
+    result = cy_http_server_start(http_ap_server);
+    PRINT_AND_ASSERT(result, "cy_http_server_start(AP) failed.\n");
+
+    /* Print instructions to UART/TFT */
+    display_configuration();
+
+    return CY_RSLT_SUCCESS;
+}
+
+/*******************************************************************************
+* Function Name: stop_sta_http_server
+********************************************************************************
+* Summary:
+*  Stops and deletes the STA HTTP server instance (if it is running).
+*  Also deinitializes the HTTP server network stack.
+*
+* Parameters:
+*  void
+*
+* Return:
+*  void
+*******************************************************************************/
+static void stop_sta_http_server(void)
+{
+    /* Stop STA server if we are in STA configured mode */
+    (void)cy_http_server_stop(http_sta_server);
+    (void)cy_http_server_delete(http_sta_server);
+    (void)cy_http_server_network_deinit();
+}
+
+/*******************************************************************************
+* Function Name: switch_to_provisioning_mode
+********************************************************************************
+* Summary:
+*  Runtime switch:
+*  - Stop STA HTTP server
+*  - Disconnect from AP
+*  - Start SoftAP provisioning server
+*
+* Parameters:
+*  void
+*
+* Return:
+*  void
+*******************************************************************************/
+static void switch_to_provisioning_mode(void)
+{
+    APP_INFO(("Runtime request: switching to provisioning mode...\r\n"));
+
+    /* Stop STA HTTP server (if running) */
+    if (reconfiguration_request == SERVER_RECONFIGURED)
+    {
+        stop_sta_http_server();
+    }
+
+    /* Disconnect from currently connected AP (if any) */
+    if (cy_wcm_is_connected_to_ap())
+    {
+        (void)cy_wcm_disconnect_ap();
+    }
+
+    /* Ensure AP is stopped before starting it again */
+    (void)cy_wcm_stop_ap();
+    /* Start SoftAP provisioning */
+    (void)start_provisioning_softap();
+}
+
+/*******************************************************************************
+* Function Name: handle_runtime_force_provisioning
+********************************************************************************
+* Summary:
+*  Checks long-press on user button. If held for PROVISION_LONG_PRESS_MS,
+*  switch device into provisioning mode.
+*
+* Parameters:
+*  uint32_t loop_period_ms: calling loop delay in ms
+*
+* Return:
+*  void
+*******************************************************************************/
+static void handle_runtime_force_provisioning(uint32_t loop_period_ms)
+{
+    static uint32_t pressed_ms = 0;
+
+    bool pressed = (cyhal_gpio_read(CYBSP_USER_BTN) == 0u); /* active-low */
+
+    if (pressed)
+    {
+        pressed_ms += loop_period_ms;
+
+        if (pressed_ms >= PROVISION_LONG_PRESS_MS)
+        {
+            pressed_ms = 0;
+            switch_to_provisioning_mode();
+        }
+    }
+    else
+    {
+        pressed_ms = 0;
+    }
+}
+
+/*******************************************************************************
 * Function Name: server_task
 ********************************************************************************
 * Summary:
@@ -935,20 +1178,71 @@ void server_task(void *arg)
 
     /* Initialize the Wi-Fi device as a STA.*/
     cy_wcm_config_t config = {.interface = CY_WCM_INTERFACE_TYPE_AP_STA};
-   
     /* Initialize the Wi-Fi device, Wi-Fi transport, and lwIP network stack.*/
     result = cy_wcm_init(&config);
-    PRINT_AND_ASSERT(result,"cy_wcm_init failed...!\n");
+    PRINT_AND_ASSERT(result, "cy_wcm_init failed...!\n");
+   
+    /**************************************************************************
+     * Phase 1: Runtime provisioning button + network store init
+     **************************************************************************/
+    provisioning_button_init();
+    (void)wifi_store_init();
 
-    result = start_ap_mode();
-   // PRINT_AND_ASSERT(result, "start SoftAP failed...!\n");
+    /**************************************************************************
+     * Phase 1: Try known networks first (STA), fallback to provisioning (AP)
+     **************************************************************************/
+    wifi_network_t known[WIFI_STORE_MAX_NETWORKS];
+    uint32_t known_count = 0;
 
-    result = configure_http_server();
-    PRINT_AND_ASSERT(result, "Failed to configure the HTTP server...!\n");
+    result = wifi_store_get_known_networks(known, WIFI_STORE_MAX_NETWORKS, &known_count);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        ERR_INFO(("wifi_store_get_known_networks failed (0x%08lx). Starting provisioning.\r\n",
+                  (unsigned long)result));
+        known_count = 0;
+    }
 
-    /* Start the HTTP server. */
-    result = cy_http_server_start(http_ap_server);
-    PRINT_AND_ASSERT(result, "Failed to start the HTTP server.\n");
+    bool connected = false;
+
+    for (uint32_t i = 0; i < known_count; i++)
+    {
+        /* Copy candidate credentials into global buffers used by start_sta_mode() */
+        memset(wifi_ssid, 0, sizeof(wifi_ssid));
+        memset(wifi_pwd,  0, sizeof(wifi_pwd));
+
+        strncpy((char*)wifi_ssid, known[i].ssid, WIFI_SSID_LEN - 1);
+        strncpy((char*)wifi_pwd,  known[i].pwd,  WIFI_PWD_LEN  - 1);
+
+        APP_INFO(("Boot: trying known network %lu/%lu: %s\r\n",
+                  (unsigned long)(i + 1), (unsigned long)known_count, known[i].ssid));
+
+        result = start_sta_mode();
+        if (result == CY_RSLT_SUCCESS)
+        {
+            connected = true;
+
+            /* Update LRU metadata */
+            (void)wifi_store_mark_used((const char*)wifi_ssid);
+
+            /* Mark device as configured and start STA server */
+            device_configured = true;
+            reconfiguration_request = SERVER_RECONFIGURED;
+
+            result = configure_http_server_sta_only();
+            PRINT_AND_ASSERT(result, "Failed to start STA-only HTTP server.\n");
+
+            display_configuration();
+            initialize_sensors();
+            break;
+        }
+    }
+
+    if (!connected)
+    {
+        APP_INFO(("Boot: no known network connected. Starting provisioning SoftAP...\r\n"));
+        result = start_provisioning_softap();
+        PRINT_AND_ASSERT(result, "start_provisioning_softap failed.\n");
+    }
 
     display_configuration();
     
@@ -1033,8 +1327,12 @@ void server_task(void *arg)
             }
         }
 
-           vTaskDelay(pdMS_TO_TICKS(50));
+            /******************************************************************
+             * Phase 1: Runtime long-press switches back to provisioning mode
+             ******************************************************************/
+            handle_runtime_force_provisioning(SERVER_LOOP_PERIOD_MS);
 
+            vTaskDelay(pdMS_TO_TICKS(SERVER_LOOP_PERIOD_MS));
         }
 
         if(SERVER_RECONFIGURE_REQUESTED == reconfiguration_request)
