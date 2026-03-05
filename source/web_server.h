@@ -63,6 +63,23 @@
 #include "mtb_light_sensor.h"
 #endif /* #ifdef ENABLE_TFT */
 
+
+/* Button used to force provisioning mode. Most BSPs define CYBSP_USER_BTN. */
+#ifndef PROVISION_FORCE_BUTTON
+#define PROVISION_FORCE_BUTTON   (CYBSP_USER_BTN)
+#endif
+
+/* Many PSoC kits use active-low user buttons (pressed = 0). */
+#ifndef PROVISION_BUTTON_ACTIVE_STATE
+#define PROVISION_BUTTON_ACTIVE_STATE (0u)
+#endif
+
+/* Long-press duration (milliseconds) to trigger reprovision at runtime. */
+#define PROVISION_LONG_PRESS_MS (2000u)
+#define PROVISION_BUTTON_DEBOUNCE_MS (50u)
+#define SERVER_LOOP_PERIOD_MS     (50u)
+
+
 #define INITIALISER_IPV4_ADDRESS(addr_var, addr_val)  addr_var = { CY_WCM_IP_VER_V4, { .v4 = (uint32_t)(addr_val) } }
 #define MAKE_IPV4_ADDRESS(a, b, c, d)                 ((((uint32_t) d) << 24) | (((uint32_t) c) << 16) | \
                                                        (((uint32_t) b) << 8) |((uint32_t) a))
