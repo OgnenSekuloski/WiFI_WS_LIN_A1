@@ -168,6 +168,63 @@ static char http_scan_response[MAX_WIFI_SCAN_HTTP_RESPONSE_LENGTH] = {0};
 
 /* True when provisioning button GPIO is initialized and safe to read. */
 static bool provisioning_button_enabled = false;
+/* True when GPIO interrupt for provisioning button is enabled. */
+static bool provisioning_button_irq_enabled = false;
+
+/* ISR-to-task signaling flags for provisioning button events. */
+static volatile bool provisioning_button_irq_pressed = false;
+static volatile bool provisioning_button_irq_released = false;
+static volatile bool provisioning_button_irq_is_pressed = false;
+static volatile bool provisioning_button_force_mode_requested = false;
+static cyhal_gpio_event_t provisioning_button_press_event = CYHAL_GPIO_IRQ_FALL;
+static cyhal_gpio_event_t provisioning_button_release_event = CYHAL_GPIO_IRQ_RISE;
+
+/* Forward declarations for runtime button/provisioning control. */
+static void handle_runtime_force_provisioning(uint32_t loop_period_ms);
+static bool is_provisioning_ap_active(void);
+static void provisioning_button_isr_callback(void *callback_arg, cyhal_gpio_event_t event);
+
+static cyhal_gpio_callback_data_t provisioning_button_cb_data =
+{
+    .callback = provisioning_button_isr_callback,
+    .callback_arg = NULL
+};
+
+/*******************************************************************************
+* Function Name: is_provisioning_ap_active
+********************************************************************************
+* Summary:
+*  Returns true if SoftAP/provisioning interface is already active.
+*******************************************************************************/
+static bool is_provisioning_ap_active(void)
+{
+    cy_wcm_ip_address_t ap_ip;
+    return (cy_wcm_get_ip_addr(CY_WCM_INTERFACE_TYPE_AP, &ap_ip) == CY_RSLT_SUCCESS);
+}
+
+/*******************************************************************************
+* Function Name: provisioning_button_isr_callback
+********************************************************************************
+* Summary:
+*  GPIO interrupt callback for provisioning button.
+*  Signals main context about button press/release state.
+*******************************************************************************/
+static void provisioning_button_isr_callback(void *callback_arg, cyhal_gpio_event_t event)
+{
+    (void)callback_arg;
+
+    if ((event & provisioning_button_press_event) != 0u)
+    {
+        provisioning_button_irq_is_pressed = true;
+        provisioning_button_irq_pressed = true;
+    }
+
+    if ((event & provisioning_button_release_event) != 0u)
+    {
+        provisioning_button_irq_is_pressed = false;
+        provisioning_button_irq_released = true;
+    }
+}
 
 /*******************************************************************************
  * Function Name: process_sse_handler
@@ -506,6 +563,11 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
     char display_buffer[DISPLAY_BUFFER_LENGTH] = {0};
 #endif /* #ifdef ENABLE_TFT */
 
+    /* Reset parsed credential buffers so reprovisioning cannot keep stale tail bytes. */
+    memset(wifi_ssid, 0, sizeof(wifi_ssid));
+    memset(wifi_pwd, 0, sizeof(wifi_pwd));
+    memset(buffer, 0, sizeof(buffer));
+
     /*decode the url encoded data using the function url_decode()*/
     url_decode(buffer, data);
 
@@ -518,7 +580,14 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
         ssid_buff_index = 0;
         /*skip '&' */
         while ((buffer[buff_index] != AMPERSAND_OPERATOR_ASCII_VALUE))
+        {
+            if (ssid_buff_index >= (WIFI_SSID_LEN - 1))
+            {
+                break;
+            }
             wifi_ssid[ssid_buff_index++] = buffer[buff_index++];
+        }
+        wifi_ssid[ssid_buff_index] = '\0';
 
         buff_index++;
         /* skip to Password */
@@ -530,9 +599,14 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
         {
             if (buffer[buff_index] == AMPERSAND_OPERATOR_ASCII_VALUE)
                 break;
+            if (ssid_buff_index >= (WIFI_PWD_LEN - 1))
+            {
+                break;
+            }
 
             wifi_pwd[ssid_buff_index++] = buffer[buff_index++];
         }
+        wifi_pwd[ssid_buff_index] = '\0';
     }
     result = cy_http_server_response_stream_write_payload(stream, WIFI_CONNECT_IN_PROGRESS, sizeof(WIFI_CONNECT_IN_PROGRESS));
     if (CY_RSLT_SUCCESS != result)
@@ -544,7 +618,15 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
     result = start_sta_mode();
     if (CY_RSLT_SUCCESS != result)
     {
-        ERR_INFO(("Wi-Fi connection failure and fallback to provisioning/AP mode.\r\n"));
+        if (provisioning_button_force_mode_requested)
+        {
+            APP_INFO(("Wi-Fi connect canceled by button request; staying in provisioning/AP mode.\r\n"));
+            provisioning_button_force_mode_requested = false;
+        }
+        else
+        {
+            ERR_INFO(("Wi-Fi connection failure and fallback to provisioning/AP mode.\r\n"));
+        }
         sprintf(response, WIFI_CONNECT_RESPONSE_START);
         response += strlen(WIFI_CONNECT_RESPONSE_START);
         sprintf(response, WIFI_CONNECT_FAIL_RESPONSE_END);
@@ -663,6 +745,7 @@ cy_rslt_t start_sta_mode()
     bool wifi_conct_stat = false;
 
     APP_INFO(("Entering STA mode.\r\n"));
+    provisioning_button_force_mode_requested = false;
 
     /*Disconnect from the currently connected AP if any*/
     wifi_conct_stat = cy_wcm_is_connected_to_ap();
@@ -683,6 +766,14 @@ cy_rslt_t start_sta_mode()
      */
     for (uint32_t conn_retries = 0; conn_retries < MAX_WIFI_RETRY_COUNT; conn_retries++)
     {
+        /* Allow long-press to interrupt STA connect attempts at any point. */
+        handle_runtime_force_provisioning(SERVER_LOOP_PERIOD_MS);
+        if (provisioning_button_force_mode_requested)
+        {
+            APP_INFO(("Wi-Fi connect aborted by button request; entering provisioning/AP mode.\r\n"));
+            return CY_RSLT_TYPE_ERROR;
+        }
+
         result = cy_wcm_connect_ap(&connect_param, &ip_address);
         if (result == CY_RSLT_SUCCESS)
         {
@@ -690,8 +781,25 @@ cy_rslt_t start_sta_mode()
             break;
         }
         ERR_INFO(("Wi-Fi connection attempt failed (error %d). Retrying in %d ms...\r\n", (int)result, WIFI_CONN_RETRY_INTERVAL_MSEC));
+        uint32_t wait_ms = 0;
+        while (wait_ms < WIFI_CONN_RETRY_INTERVAL_MSEC)
+        {
+            uint32_t slice_ms = SERVER_LOOP_PERIOD_MS;
+            if ((WIFI_CONN_RETRY_INTERVAL_MSEC - wait_ms) < slice_ms)
+            {
+                slice_ms = WIFI_CONN_RETRY_INTERVAL_MSEC - wait_ms;
+            }
 
-        vTaskDelay(pdMS_TO_TICKS(WIFI_CONN_RETRY_INTERVAL_MSEC));
+            vTaskDelay(pdMS_TO_TICKS(slice_ms));
+            wait_ms += slice_ms;
+
+            handle_runtime_force_provisioning(slice_ms);
+            if (provisioning_button_force_mode_requested)
+            {
+                APP_INFO(("Wi-Fi connect aborted by button request; entering provisioning/AP mode.\r\n"));
+                return CY_RSLT_TYPE_ERROR;
+            }
+        }
     }
 
     return result;
@@ -1030,13 +1138,27 @@ static void provisioning_button_init(void)
 
     if (result == CY_RSLT_SUCCESS)
     {
+        provisioning_button_press_event =
+            (PROVISION_BUTTON_ACTIVE_STATE == 0u) ? CYHAL_GPIO_IRQ_FALL : CYHAL_GPIO_IRQ_RISE;
+        provisioning_button_release_event =
+            (PROVISION_BUTTON_ACTIVE_STATE == 0u) ? CYHAL_GPIO_IRQ_RISE : CYHAL_GPIO_IRQ_FALL;
+
+        cyhal_gpio_register_callback(PROVISION_FORCE_BUTTON, &provisioning_button_cb_data);
+        cyhal_gpio_enable_event(PROVISION_FORCE_BUTTON,
+                                provisioning_button_press_event | provisioning_button_release_event,
+                                PROVISION_BUTTON_INTR_PRIORITY,
+                                true);
+
         provisioning_button_enabled = true;
+        provisioning_button_irq_enabled = true;
         APP_INFO(("Provisioning button configured: input/pull-up, active state=%lu.\r\n",
                   (unsigned long)PROVISION_BUTTON_ACTIVE_STATE));
+        APP_INFO(("Provisioning button interrupt enabled.\r\n"));
     }
     else
     {
         provisioning_button_enabled = false;
+        provisioning_button_irq_enabled = false;
         ERR_INFO(("Failed to initialize provisioning button GPIO (0x%08lx). "
                   "Runtime force-provisioning via button is disabled.\r\n",
                   (unsigned long)result));
@@ -1123,12 +1245,12 @@ static void stop_sta_http_server(void)
 *******************************************************************************/
 static void switch_to_provisioning_mode(void)
 {
-    APP_INFO(("Entering provisioning/AP mode.\r\n"));
-
     if (reconfiguration_request == 0)
     {
-        APP_INFO(("Already in provisioning/AP mode.\r\n"));
-        return;
+        if (is_provisioning_ap_active())
+        {
+            return;
+        }
     }
 
     /* Stop STA HTTP server (if running) */
@@ -1164,14 +1286,41 @@ static void switch_to_provisioning_mode(void)
 *******************************************************************************/
 static void handle_runtime_force_provisioning(uint32_t loop_period_ms)
 {
+    bool irq_pressed;
+
     static bool stable_pressed = false;
     static bool last_raw_pressed = false;
-    static bool long_press_handled = false;
+    static bool press_handled = false;
     static uint32_t debounce_ms = 0;
-    static uint32_t pressed_ms = 0;
+    (void)loop_period_ms;
 
     if (!provisioning_button_enabled)
     {
+        return;
+    }
+
+    irq_pressed = provisioning_button_irq_pressed;
+    (void)provisioning_button_irq_is_pressed;
+
+    provisioning_button_irq_pressed = false;
+    provisioning_button_irq_released = false;
+
+    if (provisioning_button_irq_enabled)
+    {
+        if (irq_pressed)
+        {
+            APP_INFO(("Button press detected.\r\n"));
+            if (is_provisioning_ap_active())
+            {
+                APP_INFO(("Already in provisioning/AP mode.\r\n"));
+            }
+            else
+            {
+                provisioning_button_force_mode_requested = true;
+                switch_to_provisioning_mode();
+            }
+        }
+
         return;
     }
 
@@ -1194,29 +1343,24 @@ static void handle_runtime_force_provisioning(uint32_t loop_period_ms)
         if (stable_pressed)
         {
             APP_INFO(("Button press detected.\r\n"));
-            pressed_ms = 0;
-            long_press_handled = false;
+            if (!press_handled)
+            {
+                press_handled = true;
+                if (is_provisioning_ap_active())
+                {
+                    APP_INFO(("Already in provisioning/AP mode.\r\n"));
+                }
+                else
+                {
+                    provisioning_button_force_mode_requested = true;
+                    switch_to_provisioning_mode();
+                }
+            }
         }
         else
         {
             APP_INFO(("Button released.\r\n"));
-            pressed_ms = 0;
-            long_press_handled = false;
-        }
-    }
-
-    if (stable_pressed && (!long_press_handled))
-    {
-        if (pressed_ms < PROVISION_LONG_PRESS_MS)
-        {
-            pressed_ms += loop_period_ms;
-        }
-
-        if (pressed_ms >= PROVISION_LONG_PRESS_MS)
-        {
-            APP_INFO(("Long press detected.\r\n"));
-            long_press_handled = true;
-            switch_to_provisioning_mode();
+            press_handled = false;
         }
     }
 }
@@ -1319,10 +1463,17 @@ void server_task(void *arg)
 
     if (!connected)
     {
-        ERR_INFO(("Wi-Fi connection failure and fallback to provisioning/AP mode.\r\n"));
-        APP_INFO(("Boot: no known network connected. Starting provisioning SoftAP...\r\n"));
-        result = start_provisioning_softap();
-        PRINT_AND_ASSERT(result, "start_provisioning_softap failed.\n");
+        if (is_provisioning_ap_active())
+        {
+            provisioning_button_force_mode_requested = false;
+        }
+        else
+        {
+            ERR_INFO(("Wi-Fi connection failure and fallback to provisioning/AP mode.\r\n"));
+            APP_INFO(("Boot: no known network connected. Starting provisioning SoftAP...\r\n"));
+            result = start_provisioning_softap();
+            PRINT_AND_ASSERT(result, "start_provisioning_softap failed.\n");
+        }
     }
 
     /* Waits for queue message to register a new HTTP page resource.*/

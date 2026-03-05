@@ -77,6 +77,7 @@
 /* Long-press duration (milliseconds) to trigger reprovision at runtime. */
 #define PROVISION_LONG_PRESS_MS (2000u)
 #define PROVISION_BUTTON_DEBOUNCE_MS (50u)
+#define PROVISION_BUTTON_INTR_PRIORITY (7u)
 #define SERVER_LOOP_PERIOD_MS     (50u)
 
 
