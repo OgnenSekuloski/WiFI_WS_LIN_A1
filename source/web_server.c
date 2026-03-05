@@ -950,8 +950,6 @@ void server_task(void *arg)
     result = cy_http_server_start(http_ap_server);
     PRINT_AND_ASSERT(result, "Failed to start the HTTP server.\n");
 
-    display_configuration();
-    
     /* Waits for queue message to register a new HTTP page resource.*/
     while (true)
     {
