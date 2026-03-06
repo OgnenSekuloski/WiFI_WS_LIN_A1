@@ -79,6 +79,12 @@ static bool s_inited = false;
 /* Page buffer required by cyhal_flash_write(). Must be 4-byte aligned. */
 static uint8_t s_page_buf[WIFI_STORE_MAX_PAGE_SIZE] __attribute__((aligned(4)));
 
+static cy_rslt_t write_record_to_slot(uint32_t addr,
+                                      uint32_t page_size,
+                                      uint32_t sector_size,
+                                      uint8_t erase_value,
+                                      const wifi_store_record_t* rec);
+
 /*------------------------------------------------------------------------------
  * Small CRC32 implementation (polynomial 0xEDB88320)
  * NOTE: This is not crypto; it is only for integrity (detect corruption).
@@ -355,9 +361,90 @@ static uint32_t compute_next_counter(uint32_t base, uint32_t page_size)
         }
     }
 
-    /* If maxc wraps (very unlikely for your use), it will start over.
-     * That’s okay for “recentness” in a small store. */
     return maxc + 1u;
+}
+
+/*------------------------------------------------------------------------------
+ * Deterministic overflow recovery:
+ *   - Read all valid records
+ *   - Sort by old counter ascending (oldest -> newest), with slot index tie-break
+ *   - Rewrite counters to 1..N
+ *----------------------------------------------------------------------------*/
+static cy_rslt_t renormalize_counters(uint32_t base,
+                                      uint32_t page_size,
+                                      uint32_t sector_size,
+                                      uint8_t erase_value)
+{
+    typedef struct
+    {
+        uint32_t slot;
+        uint32_t counter;
+        wifi_store_record_t rec;
+    } ranked_record_t;
+
+    ranked_record_t records[WIFI_STORE_MAX_NETWORKS];
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < WIFI_STORE_MAX_NETWORKS; i++)
+    {
+        const wifi_store_record_t* rec =
+            (const wifi_store_record_t*)slot_addr(base, page_size, i);
+
+        if (!record_is_valid(rec))
+        {
+            continue;
+        }
+
+        records[count].slot = i;
+        records[count].counter = rec->last_used_counter;
+        records[count].rec = *rec;
+        count++;
+    }
+
+    if (count == 0u)
+    {
+        return CY_RSLT_SUCCESS;
+    }
+
+    for (uint32_t a = 0; a < count; a++)
+    {
+        for (uint32_t b = a + 1; b < count; b++)
+        {
+            bool should_swap = false;
+
+            if (records[b].counter < records[a].counter)
+            {
+                should_swap = true;
+            }
+            else if ((records[b].counter == records[a].counter) &&
+                     (records[b].slot < records[a].slot))
+            {
+                should_swap = true;
+            }
+
+            if (should_swap)
+            {
+                ranked_record_t t = records[a];
+                records[a] = records[b];
+                records[b] = t;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        records[i].rec.last_used_counter = i + 1u;
+        records[i].rec.crc32 = record_crc32_calc(&records[i].rec);
+
+        uint32_t addr = slot_addr(base, page_size, records[i].slot);
+        cy_rslt_t r = write_record_to_slot(addr, page_size, sector_size, erase_value, &records[i].rec);
+        if (r != CY_RSLT_SUCCESS)
+        {
+            return r;
+        }
+    }
+
+    return CY_RSLT_SUCCESS;
 }
 
 /*------------------------------------------------------------------------------
@@ -489,7 +576,23 @@ cy_rslt_t wifi_store_save_network(const char* ssid, const char* pwd)
 
     rec.magic = WIFI_STORE_MAGIC;
     rec.version = WIFI_STORE_VERSION;
-    rec.last_used_counter = compute_next_counter(base, page_size);
+
+    uint32_t next_counter = compute_next_counter(base, page_size);
+    if (next_counter == 0u)
+    {
+        r = renormalize_counters(base, page_size, sector_size, erase_value);
+        if (r != CY_RSLT_SUCCESS)
+        {
+            return r;
+        }
+
+        next_counter = compute_next_counter(base, page_size);
+        if (next_counter == 0u)
+        {
+            return CY_RSLT_TYPE_ERROR;
+        }
+    }
+    rec.last_used_counter = next_counter;
 
     strncpy(rec.ssid, ssid, WIFI_SSID_MAX_LEN);
     rec.ssid[WIFI_SSID_MAX_LEN] = '\0';
