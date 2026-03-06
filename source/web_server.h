@@ -98,6 +98,10 @@
                                                       } while(0);
 
 #define HTTP_PORT                                    (80u)
+#define STA_MDNS_HOSTNAME                            "psoc-actuator"
+#define STA_MDNS_HTTP_SERVICE_NAME                   "PSoC Web Server"
+#define STA_MDNS_HOST_TTL_SECONDS                    (120u)
+#define STA_MDNS_SERVICE_TTL_SECONDS                 (120u)
 #define URL_LENGTH                                   (128)
 #define MAX_SOCKETS                                  (4)
 #define MAX_HTTP_RESPONSE_LENGTH                     (sizeof(HTTP_SOFTAP_STARTUP_WEBPAGE) + 64)

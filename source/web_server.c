@@ -71,6 +71,14 @@
 
 #include "wifi_network_store.h"
 
+#include "cy_network_mw_core.h"
+
+#if LWIP_MDNS_RESPONDER
+#include "lwip/apps/mdns.h"
+#include "lwip/netif.h"
+#include "lwip/tcpip.h"
+#endif
+
 /*******************************************************************************
 * Global Variables
 ********************************************************************************/
@@ -195,12 +203,21 @@ typedef enum
 
 static volatile wifi_fail_reason_t last_wifi_fail_reason = WIFI_FAIL_REASON_NONE;
 
+#if LWIP_MDNS_RESPONDER
+/* mDNS state for STA mode hostname advertisement. */
+static bool sta_mdns_initialized = false;
+static bool sta_mdns_active = false;
+static s8_t sta_mdns_http_service_slot = -1;
+#endif
+
 /* Forward declarations for runtime button/provisioning control. */
 static void handle_runtime_force_provisioning(uint32_t loop_period_ms);
 static bool is_provisioning_ap_active(void);
 static void provisioning_button_isr_callback(void *callback_arg, cyhal_gpio_event_t event);
 static wifi_fail_reason_t classify_wifi_connect_failure(cy_rslt_t result_code);
 static const char* wifi_fail_reason_to_text(wifi_fail_reason_t reason);
+static cy_rslt_t start_sta_mdns_service(void);
+static void stop_sta_mdns_service(void);
 
 static cyhal_gpio_callback_data_t provisioning_button_cb_data =
 {
@@ -289,6 +306,110 @@ static const char* wifi_fail_reason_to_text(wifi_fail_reason_t reason)
         default:
             return "unknown";
     }
+}
+
+/*******************************************************************************
+* Function Name: start_sta_mdns_service
+********************************************************************************
+* Summary:
+*  Starts mDNS responder for STA interface so the web UI is reachable as:
+*      http://<STA_MDNS_HOSTNAME>.local/
+*  Called only after STA mode is up and STA HTTP server is running.
+*
+* Return:
+*  cy_rslt_t: CY_RSLT_SUCCESS on success, error otherwise.
+*******************************************************************************/
+static cy_rslt_t start_sta_mdns_service(void)
+{
+#if LWIP_MDNS_RESPONDER
+    struct netif *sta_netif =
+        (struct netif *)cy_network_get_nw_interface(CY_NETWORK_WIFI_STA_INTERFACE, 0u);
+
+    if (sta_netif == NULL)
+    {
+        ERR_INFO(("mDNS: STA netif handle is NULL.\r\n"));
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+    LOCK_TCPIP_CORE();
+
+    if (!sta_mdns_initialized)
+    {
+        mdns_resp_init();
+        sta_mdns_initialized = true;
+    }
+
+    if (sta_mdns_active)
+    {
+        (void)mdns_resp_remove_netif(sta_netif);
+        sta_mdns_http_service_slot = -1;
+        sta_mdns_active = false;
+    }
+
+    err_t mdns_result = mdns_resp_add_netif(sta_netif, STA_MDNS_HOSTNAME, STA_MDNS_HOST_TTL_SECONDS);
+    if (mdns_result != ERR_OK)
+    {
+        UNLOCK_TCPIP_CORE();
+        ERR_INFO(("mDNS: mdns_resp_add_netif failed (%d).\r\n", (int)mdns_result));
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+    sta_mdns_http_service_slot = mdns_resp_add_service(sta_netif,
+                                                       STA_MDNS_HTTP_SERVICE_NAME,
+                                                       "_http",
+                                                       DNSSD_PROTO_TCP,
+                                                       HTTP_PORT,
+                                                       STA_MDNS_SERVICE_TTL_SECONDS,
+                                                       NULL,
+                                                       NULL);
+
+    if (sta_mdns_http_service_slot < 0)
+    {
+        ERR_INFO(("mDNS: HTTP service registration failed (slot=%d).\r\n",
+                  (int)sta_mdns_http_service_slot));
+    }
+
+    mdns_resp_announce(sta_netif);
+    sta_mdns_active = true;
+    UNLOCK_TCPIP_CORE();
+
+    APP_INFO(("mDNS started: http://%s.local/\r\n", STA_MDNS_HOSTNAME));
+    return CY_RSLT_SUCCESS;
+#else
+    return CY_RSLT_SUCCESS;
+#endif
+}
+
+/*******************************************************************************
+* Function Name: stop_sta_mdns_service
+********************************************************************************
+* Summary:
+*  Stops mDNS responder binding for STA interface.
+*******************************************************************************/
+static void stop_sta_mdns_service(void)
+{
+#if LWIP_MDNS_RESPONDER
+    if (!sta_mdns_active)
+    {
+        return;
+    }
+
+    struct netif *sta_netif =
+        (struct netif *)cy_network_get_nw_interface(CY_NETWORK_WIFI_STA_INTERFACE, 0u);
+
+    if (sta_netif == NULL)
+    {
+        sta_mdns_http_service_slot = -1;
+        sta_mdns_active = false;
+        return;
+    }
+
+    LOCK_TCPIP_CORE();
+    (void)mdns_resp_remove_netif(sta_netif);
+    sta_mdns_http_service_slot = -1;
+    sta_mdns_active = false;
+    UNLOCK_TCPIP_CORE();
+#endif
 }
 
 /*******************************************************************************
@@ -1039,6 +1160,13 @@ cy_rslt_t configure_http_server_sta_only(void)
     result = cy_http_server_start(http_sta_server);
     PRINT_AND_ASSERT(result, "Failed to start STA HTTP server.\n");
 
+    /* Advertise STA web UI hostname on LAN via mDNS. */
+    cy_rslt_t mdns_result = start_sta_mdns_service();
+    if (mdns_result != CY_RSLT_SUCCESS)
+    {
+        ERR_INFO(("mDNS start failed in STA-only mode.\r\n"));
+    }
+
     return result;
 }
 
@@ -1128,6 +1256,13 @@ cy_rslt_t reconfigure_http_server(void)
     /* Start the HTTP server. */
     result = cy_http_server_start(http_sta_server);
     PRINT_AND_ASSERT(result, "Failed to start the HTTP server.\n");
+
+    /* Advertise STA web UI hostname on LAN via mDNS. */
+    cy_rslt_t mdns_result = start_sta_mdns_service();
+    if (mdns_result != CY_RSLT_SUCCESS)
+    {
+        ERR_INFO(("mDNS start failed during AP->STA reconfigure.\r\n"));
+    }
    
     return result;
 }
@@ -1282,6 +1417,9 @@ static cy_rslt_t start_provisioning_softap(void)
 
     APP_INFO(("Entering provisioning/AP mode.\r\n"));
 
+    /* Provisioning mode should not advertise STA mDNS hostname. */
+    stop_sta_mdns_service();
+
     /* Reset provisioning state variables */
     device_configured = false;
     reconfiguration_request = 0;
@@ -1319,6 +1457,8 @@ static cy_rslt_t start_provisioning_softap(void)
 *******************************************************************************/
 static void stop_sta_http_server(void)
 {
+    stop_sta_mdns_service();
+
     /* Stop STA server if we are in STA configured mode */
     (void)cy_http_server_stop(http_sta_server);
     (void)cy_http_server_delete(http_sta_server);
@@ -1808,6 +1948,9 @@ void display_configuration(void)
         APP_INFO(("******************************************************************\r\n"));
         APP_INFO(("On a device connected to the '%s' Wi-Fi network, \r\n", associated_ap_info.SSID));
         APP_INFO(("Open a web browser and go to : %s\r\n", http_url));
+#if LWIP_MDNS_RESPONDER
+        APP_INFO(("Or use mDNS hostname URL      : http://%s.local/\r\n", STA_MDNS_HOSTNAME));
+#endif
 #ifdef ENABLE_TFT
         APP_INFO(("Use the webpage to observe the light sensor voltage.\r\n"));
 #endif /* #ifdef ENABLE_TFT */

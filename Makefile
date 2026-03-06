@@ -107,6 +107,7 @@ DISABLE_COMPONENTS=
 # manually add source code to the build process from a location not searched
 # by default, or otherwise not found by the build system.
 SOURCES=
+SOURCES+=../mtb_shared/lwip/STABLE-2_1_2_RELEASE/src/apps/mdns/mdns.c
 
 # Like SOURCES, but for include directories. Value should be paths to
 # directories (without a leading -I).
@@ -120,6 +121,8 @@ DEFINES+=$(MBEDTLSFLAGS) CYBSP_WIFI_CAPABLE CY_RETARGET_IO_CONVERT_LF_TO_CRLF CY
 
 DEFINES+=ENABLE_HTTP_SERVER_LOGS
 DEFINES+=MAX_NUMBER_OF_HTTP_SERVER_RESOURCES=10
+DEFINES+=LWIP_MDNS_RESPONDER=1
+DEFINES+=LWIP_NUM_NETIF_CLIENT_DATA=1
 
 # Select softfp or hardfp floating point. Default is softfp.
 VFP_SELECT=
