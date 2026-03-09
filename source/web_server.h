@@ -43,17 +43,13 @@
 
 /* Wi-Fi connection manager header files */
 #include "cy_wcm.h"
-#include "cybsp.h"
 //#include "cy_lwip.h"
 #include "cyhal_gpio.h"
-
-/* CAPSENSE header file */
-#include "cycfg_capsense.h"
 
 #include "cyabs_rtos.h"
 #include "cy_http_server.h"
 #include "html_web_page.h"
-#include "sensors.h"
+#include "LIN_actuator.h"
 
 #ifdef ENABLE_TFT
 /* CY8CKIT-028-TFT shield and LCD library */
@@ -116,6 +112,7 @@
 #define MAX_WIFI_SCAN_HTTP_RESPONSE_LENGTH           (2048)
 
 #define SENSOR_BUFFER_LENGTH                         (128)
+#define ACTUATOR_STATUS_BUFFER_LENGTH               (256)
 #define DISPLAY_BUFFER_LENGTH                        (64)
 
 /* SoftAP Credentials */
@@ -156,8 +153,9 @@
 #define LFLF                                         "\n\n"
 #define CHUNKED_CONTENT_LENGTH                       (0u)
 
-#define INCREASE                                     ("Increase")
-#define DECREASE                                     ("Decrease")
+#define LIN_HTTP_CMD_CALIBRATE                        ("CALIBRATE")
+#define LIN_HTTP_CMD_OPEN                             ("OPEN")
+#define LIN_HTTP_CMD_CLOSE                            ("CLOSE")
 
 #define MAKE_IP_PARAMETERS(a, b, c, d)               ((((uint32_t) d) << 24) | \
                                                      (((uint32_t) c) << 16) | \

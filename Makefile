@@ -109,6 +109,9 @@ DISABLE_COMPONENTS=
 SOURCES=
 SOURCES+=../mtb_shared/lwip/STABLE-2_1_2_RELEASE/src/apps/mdns/mdns.c
 
+# Exclude legacy PWM/CapSense implementation from this LIN actuator variant.
+CY_IGNORE+=source/sensors.c
+
 # Like SOURCES, but for include directories. Value should be paths to
 # directories (without a leading -I).
 INCLUDES=

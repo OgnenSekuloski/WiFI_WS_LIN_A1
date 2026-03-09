@@ -64,14 +64,11 @@
 #include <string.h>
 #include <ctype.h>
 
-/* HTTP server task header file. */
-#include "cy_http_server.h"
-#include "html_web_page.h"
-#include "web_server.h"
-
 #include "wifi_network_store.h"
 
 #include "cy_network_mw_core.h"
+
+#include "LIN_actuator.h"
 
 #if LWIP_MDNS_RESPONDER
 #include "lwip/apps/mdns.h"
@@ -161,12 +158,6 @@ static char ssid_buff[BUFFER_LENGTH];
 
 /*Variable to indicate re-configuration request*/
 volatile int8_t reconfiguration_request = 0;
-
-/* Flag to indicate status of increase pwm value command. */
-volatile bool increase_pwm = false;
-
-/* Flag to indicate status of decrease pwm value command. */
-volatile bool decrease_pwm = false;
 
 /* Array to store Wi-Fi connect response. */
 static char http_wifi_connect_response[WIFI_CONNECT_RESPONSE_LENGTH] = {0};
@@ -521,14 +512,27 @@ int32_t softap_resource_handler(const char *url_path,
         }
         else
         {
-            /* Compare the input from client to increase or decrease pwm value. */
-            if(!strncmp((char *)http_message_body->data, INCREASE, 8))
+            size_t cmd_len = (size_t)http_message_body->data_length;
+            const uint8_t *cmd_data = http_message_body->data;
+
+            if ((cmd_len == strlen(LIN_HTTP_CMD_CALIBRATE)) &&
+                (memcmp(cmd_data, LIN_HTTP_CMD_CALIBRATE, cmd_len) == 0))
             {
-                increase_pwm = true;
+                lin_actuator_request_calibration();
             }
-            else if(!strncmp((char *)http_message_body->data, DECREASE, 8))
+            else if ((cmd_len == strlen(LIN_HTTP_CMD_OPEN)) &&
+                     (memcmp(cmd_data, LIN_HTTP_CMD_OPEN, cmd_len) == 0))
             {
-                decrease_pwm = true;
+                lin_actuator_request_open();
+            }
+            else if ((cmd_len == strlen(LIN_HTTP_CMD_CLOSE)) &&
+                     (memcmp(cmd_data, LIN_HTTP_CMD_CLOSE, cmd_len) == 0))
+            {
+                lin_actuator_request_close();
+            }
+            else
+            {
+                ERR_INFO(("Unknown actuator command received from HTTP client.\r\n"));
             }
 
             /* Send the HTTP response. */
@@ -1606,7 +1610,8 @@ static void handle_runtime_force_provisioning(uint32_t loop_period_ms)
 * Function Name: server_task
 ********************************************************************************
 * Summary:
-*  Task that initializes the device as SoftAp, and starts the HTTP server
+*  Task that initializes the device networking, starts the HTTP server,
+*  and periodically services the LIN actuator state machine.
 *
 * Parameters:
 *  arg - Unused.
@@ -1620,37 +1625,38 @@ void server_task(void *arg)
     cy_rslt_t result = CY_RSLT_SUCCESS;
     (void)arg;
 
+    char http_response[DEVICE_DATA_RESPONSE_LENGTH] = {0};
+    char status_buffer[ACTUATOR_STATUS_BUFFER_LENGTH] = {0};
+
 #ifdef ENABLE_TFT
     result = mtb_st7789v_init8(&tft_pins);
     CY_ASSERT(result == CY_RSLT_SUCCESS);
 
-    uint8_t light_sensor_reading = 0;
-    uint16_t light_sensor_voltage = 0;
-#endif /* #ifdef ENABLE_TFT */
-
-    uint8_t duty_cycle_reading = 0;
-    char sensor_value_buffer[SENSOR_BUFFER_LENGTH];
-    char http_response[MAX_HTTP_RESPONSE_LENGTH] = {0};
-
-#ifdef ENABLE_TFT
-    /*Initialize and setup TFT display */
+    /* Initialize and setup TFT display */
     initialize_display();
-#endif /* #ifdef ENABLE_TFT */
+#endif /* ENABLE_TFT */
 
-    /* Initialize the Wi-Fi device as a STA.*/
-    cy_wcm_config_t config = {.interface = CY_WCM_INTERFACE_TYPE_AP_STA};
-    /* Initialize the Wi-Fi device, Wi-Fi transport, and lwIP network stack.*/
+    /**************************************************************************
+     * Initialize LIN actuator module once before entering the main loop.
+     **************************************************************************/
+    result = lin_actuator_init();
+    PRINT_AND_ASSERT(result, "LIN actuator init failed.\r\n");
+
+    /* Initialize the Wi-Fi device as AP + STA. */
+    cy_wcm_config_t config = { .interface = CY_WCM_INTERFACE_TYPE_AP_STA };
+
+    /* Initialize the Wi-Fi device, transport, and lwIP network stack. */
     result = cy_wcm_init(&config);
     PRINT_AND_ASSERT(result, "cy_wcm_init failed...!\n");
-   
+
     /**************************************************************************
-     * Phase 1: Runtime provisioning button + network store init
+     * Runtime provisioning button + network store init
      **************************************************************************/
     provisioning_button_init();
     (void)wifi_store_init();
 
     /**************************************************************************
-     * Phase 1: Try known networks first (STA), fallback to provisioning (AP)
+     * Try known networks first (STA), fallback to provisioning (AP)
      **************************************************************************/
     wifi_network_t known[WIFI_STORE_MAX_NETWORKS];
     uint32_t known_count = 0;
@@ -1667,7 +1673,6 @@ void server_task(void *arg)
 
     for (uint32_t i = 0; i < known_count; i++)
     {
-        /* Copy candidate credentials into global buffers used by start_sta_mode() */
         memset(wifi_ssid, 0, sizeof(wifi_ssid));
         memset(wifi_pwd,  0, sizeof(wifi_pwd));
 
@@ -1682,10 +1687,8 @@ void server_task(void *arg)
         {
             connected = true;
 
-            /* Update LRU metadata */
             (void)wifi_store_mark_used((const char*)wifi_ssid);
 
-            /* Mark device as configured and start STA server */
             device_configured = true;
             reconfiguration_request = SERVER_RECONFIGURED;
 
@@ -1693,7 +1696,6 @@ void server_task(void *arg)
             PRINT_AND_ASSERT(result, "Failed to start STA-only HTTP server.\n");
 
             display_configuration();
-            initialize_sensors();
             break;
         }
     }
@@ -1709,111 +1711,83 @@ void server_task(void *arg)
             ERR_INFO(("Wi-Fi connection failure (%s) and fallback to provisioning/AP mode.\r\n",
                       wifi_fail_reason_to_text(last_wifi_fail_reason)));
             APP_INFO(("Boot: no known network connected. Starting provisioning SoftAP...\r\n"));
+
             result = start_provisioning_softap();
             PRINT_AND_ASSERT(result, "start_provisioning_softap failed.\n");
         }
     }
 
-    /* Waits for queue message to register a new HTTP page resource.*/
+    /**************************************************************************
+     * Main server loop
+     **************************************************************************/
     while (true)
     {
-        /**********************************************************************
-         * Runtime long-press check in all modes (AP provisioning + STA).
-         *********************************************************************/
+        /* Runtime long-press check in all modes (AP provisioning + STA). */
         handle_runtime_force_provisioning(SERVER_LOOP_PERIOD_MS);
 
-        if(SERVER_RECONFIGURED == reconfiguration_request)
+        if (SERVER_RECONFIGURED == reconfiguration_request)
         {
-            /* Process all widgets */
-            result = Cy_CapSense_ProcessAllWidgets(&cy_capsense_context);
-            if (CY_RSLT_SUCCESS != result)
-            {
-                ERR_INFO(("Failed to scan all widgets.\r\n"));
-            }
+            /* Run one step of the LIN actuator state machine. */
+            lin_actuator_task();
 
-            /* Process touch input */
-            process_touch();
-
-            /* Initiate next scan */
-            result = Cy_CapSense_ScanAllWidgets(&cy_capsense_context);
-            while(CY_CAPSENSE_BUSY == Cy_CapSense_IsBusy(&cy_capsense_context));
-
-            if(decrease_pwm)
-            {
-                decrease_duty_cycle();
-                decrease_pwm = false;
-
-            }
-            if(increase_pwm)
-            {
-                increase_duty_cycle();
-                increase_pwm = false;
-            }
-
-            /*retrieve pwm value*/
-            duty_cycle_reading = get_duty_cycle();
+            /* Build status text for browser SSE updates. */
+            lin_actuator_get_http_status(status_buffer, sizeof(status_buffer));
+            snprintf(http_response, sizeof(http_response), "%s", status_buffer);
 
 #ifdef ENABLE_TFT
-           /*Calculate lightsensor voltage.*/
-           light_sensor_reading = mtb_light_sensor_light_level(&light_sensor_obj);
-           light_sensor_voltage = (uint32_t)((light_sensor_reading * LIGHTSENSOR_ADC_MAX_VOLTAGE) / LIGHTSENSOR_ADC_MAX_COUNT);
-#endif /* #ifdef ENABLE_TFT */
+            /* Optional: show LIN status on TFT. Keep this simple at first. */
+            GUI_Clear();
+            GUI_DispStringAt("LIN Actuator Control", 0, 0);
+            GUI_DispStringAt(status_buffer, 0, 20);
+#endif /* ENABLE_TFT */
 
-#ifdef ENABLE_TFT
-        /* Display data on LCD */
-        sprintf(sensor_value_buffer, "%04d mV", light_sensor_voltage);
-        GUI_DispStringAt(sensor_value_buffer, SENSOR_DISPLAY_OFFSET, light_sensor_row_print);
-        sprintf(sensor_value_buffer, "%03d %%", duty_cycle_reading);
-        GUI_DispStringAt(sensor_value_buffer, SENSOR_DISPLAY_OFFSET, duty_cycle_row_print);
-#endif /* #ifdef ENABLE_TFT */
+            /* Send event stream update to browser */
+            if (http_event_stream != NULL)
+            {
+                result = cy_http_server_response_stream_write_payload(http_event_stream,
+                                                                      (const void*)EVENT_STREAM_DATA,
+                                                                      sizeof(EVENT_STREAM_DATA) - 1);
+                if (result != CY_RSLT_SUCCESS)
+                {
+                    ERR_INFO(("Updating event stream failed\r\n"));
+                    http_event_stream = NULL;
+                }
 
-        /* Send the event stream with light sensor voltage and duty cycle */
-        if( http_event_stream != NULL )
-        {
-#ifdef ENABLE_TFT
-            sprintf(sensor_value_buffer, "Light Sensor Voltage: %dmV <br> PWM Duty Cycle: %d", light_sensor_voltage, duty_cycle_reading);
+                if (http_event_stream != NULL)
+                {
+                    result = cy_http_server_response_stream_write_payload(http_event_stream,
+                                                                          http_response,
+                                                                          strlen(http_response));
+                    if (result != CY_RSLT_SUCCESS)
+                    {
+                        ERR_INFO(("Updating event stream failed\r\n"));
+                        http_event_stream = NULL;
+                    }
+                }
 
-#else
-            sprintf(sensor_value_buffer, "PWM Duty Cycle: %d", duty_cycle_reading);
-#endif /* #ifdef ENABLE_TFT */
-            strcpy(http_response, (char*)sensor_value_buffer);
-
-            /* Add event stream header */
-            result = cy_http_server_response_stream_write_payload( http_event_stream, (const void*)EVENT_STREAM_DATA, sizeof( EVENT_STREAM_DATA ) - 1);
-            if(result != CY_RSLT_SUCCESS){
-                ERR_INFO(("Updating event stream failed"));
-                http_event_stream = NULL;
-            }
-
-            /* Message to client */
-            result = cy_http_server_response_stream_write_payload( http_event_stream, http_response, sizeof(http_response) - 1);
-            if(result != CY_RSLT_SUCCESS){
-                ERR_INFO(("Updating event stream failed"));
-                http_event_stream = NULL;
-            }
-
-            /* SSE is ended with two line feeds */
-            result = cy_http_server_response_stream_write_payload( http_event_stream, (const void*)LFLF, sizeof( LFLF ) - 1);
-            if(result != CY_RSLT_SUCCESS){
-                ERR_INFO(("Updating event stream failed\r\n"));
-                http_event_stream = NULL;
+                if (http_event_stream != NULL)
+                {
+                    result = cy_http_server_response_stream_write_payload(http_event_stream,
+                                                                          (const void*)LFLF,
+                                                                          sizeof(LFLF) - 1);
+                    if (result != CY_RSLT_SUCCESS)
+                    {
+                        ERR_INFO(("Updating event stream failed\r\n"));
+                        http_event_stream = NULL;
+                    }
+                }
             }
         }
 
-        }
-
-        if(SERVER_RECONFIGURE_REQUESTED == reconfiguration_request)
+        if (SERVER_RECONFIGURE_REQUESTED == reconfiguration_request)
         {
             reconfigure_http_server();
             display_configuration();
-            initialize_sensors();
             reconfiguration_request = SERVER_RECONFIGURED;
         }
 
         vTaskDelay(pdMS_TO_TICKS(SERVER_LOOP_PERIOD_MS));
-
     }
-
 }
 
 #ifdef ENABLE_TFT
@@ -1952,9 +1926,9 @@ void display_configuration(void)
         APP_INFO(("Or use mDNS hostname URL      : http://%s.local/\r\n", STA_MDNS_HOSTNAME));
 #endif
 #ifdef ENABLE_TFT
-        APP_INFO(("Use the webpage to observe the light sensor voltage.\r\n"));
+        APP_INFO(("Use the webpage to monitor LIN actuator status updates.\r\n"));
 #endif /* #ifdef ENABLE_TFT */
-        APP_INFO(("Observe and vary the LED duty cycle from the webpage.\r\n"));
+        APP_INFO(("Use the webpage controls to CALIBRATE, OPEN, or CLOSE the LIN actuator.\r\n"));
         APP_INFO(("******************************************************************\r\n"));
 
 #ifdef ENABLE_TFT
@@ -1974,11 +1948,11 @@ void display_configuration(void)
         row += ROW_OFFSET;
         row += ROW_OFFSET;
         light_sensor_row_print = row;
-        GUI_DispStringAt("Light Sensor Voltage", 0, row);
+        GUI_DispStringAt("LIN Actuator Status", 0, row);
         row += ROW_OFFSET;
         row += ROW_OFFSET;
         duty_cycle_row_print = row;
-        GUI_DispStringAt("PWM Duty Cycle", 0, row);
+        GUI_DispStringAt("Last LIN Event", 0, row);
 #endif /* #ifdef ENABLE_TFT */
     }
 }

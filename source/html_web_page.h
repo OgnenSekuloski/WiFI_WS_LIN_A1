@@ -224,10 +224,9 @@
         "<body>" \
             "<h1>Device Data - Redirect page </h1>" \
             "<p>" \
-                "To view the device data please connect your PC to the same Wi-Fi network to which " \
-                 "you have connected the device. Open the web browser of your choice and enter " \
-                 "the URL http://<i><b>IP address</i></b>:80, where <i><b>IP address</i></b> is " \
-                 "the one that is displayed on the UART terminal." \
+                "To view the actuator control page, connect your PC or phone to the same Wi-Fi network " \
+                "as the device. Then open either the hostname " \
+                "<i><b>http://psoc-actuator.local/</b></i> or the device IP address shown on the UART terminal." \
             "</p>" \
         "</body>" \
     "</html>"
@@ -236,63 +235,52 @@
 #define SOFTAP_DEVICE_DATA \
         "<!DOCTYPE html> " \
         "<html>" \
-        "<head><title>Wi-Fi Web Server Demo Device Status</title></head>" \
+        "<head><title>PSoC LIN Actuator Control</title></head>" \
         "<body>" \
-            "<h1 style=\"text-align: center\" > Device Data Logger </h1>" LOGO \
+            "<h1 style=\"text-align: center\" > LIN Actuator Control </h1>" LOGO \
             "<br><br>" \
-            "<p>Click to increase or decrease duty cycle</p>" \
-            "<button type=\"button\" onclick=\"increase()\" id=\"increase_btn\">Increase</button> " \
-            "<button type=\"button\" onclick=\"decrease()\" id=\"decrease_btn\">Decrease</button> " \
+            "<p>Use the buttons below to control the LIN actuator.</p>" \
+            "<button type=\"button\" onclick=\"sendCommand('CALIBRATE')\" id=\"calibrate_btn\">Calibrate</button> " \
+            "<button type=\"button\" onclick=\"sendCommand('OPEN')\" id=\"open_btn\">Open</button> " \
+            "<button type=\"button\" onclick=\"sendCommand('CLOSE')\" id=\"close_btn\">Close</button> " \
             "<br><br>" \
-            "<br><br>" \
-            "<div id=\"device_data\" value=\"100\"></div>" \
+            "<div id=\"device_data\"></div>" \
             "<script>" \
-                " function btn_disable_function() {" \
-                " var increase_btn_id = document.getElementById(\"increase_btn\");" \
-                " var decrease_btn_id = document.getElementById(\"decrease_btn\");" \
-                " increase_btn_id.innerText = \"Please Wait...\";" \
-                " decrease_btn_id.innerText = \"Please Wait...\";" \
-                " increase_btn_id.disabled = true;" \
-                " decrease_btn_id.disabled = true;" \
-                " setTimeout(function()" \
-                " {" \
-                    " increase_btn_id.innerText = \"Increase\";" \
-                    " decrease_btn_id.innerText = \"Decrease\";" \
-                    " increase_btn_id.disabled = false;" \
-                    " decrease_btn_id.disabled = false;" \
-                    " },1000);" \
-                " }" \
-            "function increase() { " \
-                " btn_disable_function();" \
-                " var xhttp = new XMLHttpRequest(); "\
-                " xhttp.onreadystatechange = function() { "\
-                    "   if (this.readyState === 4 && this.status == 200) { " \
-                        "   } "\
-                    "}; "\
-                    "xhttp.open(\"POST\", \"/\", true); "\
-                    "xhttp.setRequestHeader(\"Content-type\", \"application/x-www-form-urlencoded\"); "\
-                    "xhttp.send(\"Increase\");"\
-            "} "\
-            "function decrease() { " \
-                "  btn_disable_function();" \
-                "  var xhttp = new XMLHttpRequest(); " \
-                "  xhttp.onreadystatechange = function() { " \
-                    "    if (this.readyState === 4 && this.status == 200) { " \
-                    "    } " \
-                    "  }; " \
-                    "xhttp.open(\"POST\", \"/\", true); " \
-                    "xhttp.setRequestHeader(\"Content-type\", \"application/x-www-form-urlencoded\"); "\
-                    "xhttp.send(\"Decrease\"); " \
-            "} "\
-        "if(typeof(EventSource) !== \"undefined\") {" \
-            "var source = new EventSource(\"/events\");" \
-            "source.onmessage = function(event) {" \
-                "document.getElementById(\"device_data\").innerHTML = event.data;" \
-                "  };" \
-        "} else {" \
-            "document.getElementById(\"device_data\").innerHTML = \"Sorry, your browser does not support server-sent events...\";" \
-        "}" \
-        "</script>" \
+                "function setButtonsDisabled(disabled, text) {" \
+                    "document.getElementById('calibrate_btn').disabled = disabled;" \
+                    "document.getElementById('open_btn').disabled = disabled;" \
+                    "document.getElementById('close_btn').disabled = disabled;" \
+                    "if(disabled) {" \
+                        "document.getElementById('calibrate_btn').innerText = text;" \
+                        "document.getElementById('open_btn').innerText = text;" \
+                        "document.getElementById('close_btn').innerText = text;" \
+                    "} else {" \
+                        "document.getElementById('calibrate_btn').innerText = 'Calibrate';" \
+                        "document.getElementById('open_btn').innerText = 'Open';" \
+                        "document.getElementById('close_btn').innerText = 'Close';" \
+                    "}" \
+                "}" \
+                "function sendCommand(cmd) {" \
+                    "setButtonsDisabled(true, 'Please Wait');" \
+                    "var xhttp = new XMLHttpRequest();" \
+                    "xhttp.onreadystatechange = function() {" \
+                        "if (this.readyState === 4) {" \
+                            "setTimeout(function(){ setButtonsDisabled(false, ''); }, 1000);" \
+                        "}" \
+                    "};" \
+                    "xhttp.open('POST', '/', true);" \
+                    "xhttp.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');" \
+                    "xhttp.send(cmd);" \
+                "}" \
+                "if(typeof(EventSource) !== 'undefined') {" \
+                    "var source = new EventSource('/events');" \
+                    "source.onmessage = function(event) {" \
+                        "document.getElementById('device_data').innerHTML = event.data;" \
+                    "};" \
+                "} else {" \
+                    "document.getElementById('device_data').innerHTML = 'Sorry, your browser does not support server-sent events.';" \
+                "}" \
+            "</script>" \
         "</body>" \
         "</html>"
 
