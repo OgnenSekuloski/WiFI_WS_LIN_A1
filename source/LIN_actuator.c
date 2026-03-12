@@ -113,9 +113,11 @@ typedef struct
 
     bool initialized;
     bool all_positions_learned;
+    bool motion_command_active;
 
     uint8_t tx_data[LIN_FRAME_DATA_LEN];
     uint8_t rx_data[LIN_STATUS_RESPONSE_LEN];
+    uint8_t last_flap_command;
 
     uint32_t elapsed_since_exchange_ms;
     uint32_t simulated_exchange_counter;
@@ -140,6 +142,7 @@ static void lin_set_debug_fmt(const char *fmt, ...);
 
 static void lin_prepare_command(uint8_t calibration_cmd, uint8_t flap_pos);
 static void lin_send_command_frame(uint8_t raw_id, const uint8_t *data, size_t len);
+static void lin_log_rx_bytes(void);
 
 static bool lin_request_and_read_status(void);
 static bool lin_parse_expected_status(bool *closed_position_learned, bool *all_positions_learned);
@@ -355,6 +358,31 @@ static void lin_send_command_frame(uint8_t raw_id, const uint8_t *data, size_t l
 #endif
 }
 
+/*******************************************************************************
+ * Function Name: lin_log_rx_bytes
+ *******************************************************************************
+ * Summary:
+ *  Prints the full received status payload for bring-up debugging.
+ *
+ * Parameters:
+ *  void
+ *
+ * Return:
+ *  void
+ *
+ *******************************************************************************/
+static void lin_log_rx_bytes(void)
+{
+    size_t i;
+
+    printf("Info: LIN: RX bytes:");
+    for (i = 0u; i < LIN_STATUS_RESPONSE_LEN; i++)
+    {
+        printf(" [%u]=0x%02X", (unsigned int)i, lin_ctx.rx_data[i]);
+    }
+    printf("\r\n");
+}
+
 #if !LIN_ACTUATOR_ENABLE_SIMULATION
 /*******************************************************************************
  * Function Name: lin_send_header_request
@@ -449,6 +477,7 @@ static bool lin_request_and_read_status(void)
     printf("Info: LIN: SIM status generated. BYTE2=0x%02X BYTE4=0x%02X\r\n",
            lin_ctx.rx_data[LIN_STATUS_SIGNATURE_INDEX],
            lin_ctx.rx_data[LIN_STATUS_FLAGS_INDEX]);
+    lin_log_rx_bytes();
 
     return true;
 #else
@@ -481,6 +510,7 @@ static bool lin_request_and_read_status(void)
     printf("Info: LIN: Status response received. BYTE2=0x%02X BYTE4=0x%02X\r\n",
            lin_ctx.rx_data[LIN_STATUS_SIGNATURE_INDEX],
            lin_ctx.rx_data[LIN_STATUS_FLAGS_INDEX]);
+    lin_log_rx_bytes();
 
     return true;
 #endif
@@ -557,6 +587,7 @@ static void lin_handle_pending_request(void)
     switch (lin_ctx.pending_request)
     {
         case LIN_REQUEST_CALIBRATE:
+            lin_ctx.motion_command_active = false;
             lin_ctx.state = LIN_ACTUATOR_STATE_CALIBRATING_TO_CLOSED;
             lin_ctx.all_positions_learned = false;
             lin_ctx.simulated_exchange_counter = 0u;
@@ -570,8 +601,10 @@ static void lin_handle_pending_request(void)
             }
             else
             {
+                lin_ctx.motion_command_active = true;
+                lin_ctx.last_flap_command = LIN_FLAP_OPEN;
                 lin_ctx.state = LIN_ACTUATOR_STATE_OPENING;
-                lin_set_debug("Open command accepted.");
+                lin_set_debug("Open command accepted. Repeating until replaced or calibration starts.");
             }
             break;
 
@@ -582,8 +615,10 @@ static void lin_handle_pending_request(void)
             }
             else
             {
+                lin_ctx.motion_command_active = true;
+                lin_ctx.last_flap_command = LIN_FLAP_CLOSE;
                 lin_ctx.state = LIN_ACTUATOR_STATE_CLOSING;
-                lin_set_debug("Close command accepted.");
+                lin_set_debug("Close command accepted. Repeating until replaced or calibration starts.");
             }
             break;
 
@@ -652,21 +687,29 @@ static void lin_execute_state_machine_step(void)
             break;
 
         case LIN_ACTUATOR_STATE_OPENING:
-            lin_prepare_command(LIN_CALIBRATION_IDLE, LIN_FLAP_OPEN);
+            if (!lin_ctx.motion_command_active)
+            {
+                lin_ctx.state = LIN_ACTUATOR_STATE_READY;
+                lin_set_debug("Open motion cancelled. Actuator is ready.");
+                break;
+            }
+
+            lin_prepare_command(LIN_CALIBRATION_IDLE, lin_ctx.last_flap_command);
             lin_send_command_frame(LIN_COMMAND_ID, lin_ctx.tx_data, LIN_FRAME_DATA_LEN);
             (void)lin_request_and_read_status();
-
-            lin_ctx.state = LIN_ACTUATOR_STATE_READY;
-            lin_set_debug("Open command frame sent.");
             break;
 
         case LIN_ACTUATOR_STATE_CLOSING:
-            lin_prepare_command(LIN_CALIBRATION_IDLE, LIN_FLAP_CLOSE);
+            if (!lin_ctx.motion_command_active)
+            {
+                lin_ctx.state = LIN_ACTUATOR_STATE_READY;
+                lin_set_debug("Close motion cancelled. Actuator is ready.");
+                break;
+            }
+
+            lin_prepare_command(LIN_CALIBRATION_IDLE, lin_ctx.last_flap_command);
             lin_send_command_frame(LIN_COMMAND_ID, lin_ctx.tx_data, LIN_FRAME_DATA_LEN);
             (void)lin_request_and_read_status();
-
-            lin_ctx.state = LIN_ACTUATOR_STATE_READY;
-            lin_set_debug("Close command frame sent.");
             break;
 
         case LIN_ACTUATOR_STATE_ERROR:
