@@ -18,15 +18,6 @@
 *     - At the address provided by the linker symbol __wifi_creds_flash_start
 *       (typically placed into the em_eeprom memory region in linker.ld).
 *
-* IMPORTANT (your current linker error):
-*   If you see: undefined reference to `__wifi_creds_flash_start`
-*   then your linker script did NOT export the symbol correctly.
-*
-*   In linker.ld, DO THIS (recommended):
-*     PROVIDE(__wifi_creds_flash_start = ORIGIN(em_eeprom));
-*
-*   (Do not rely on a plain assignment; PROVIDE is safer and conventional.)
-*
 *******************************************************************************/
 
 #include "wifi_network_store.h"

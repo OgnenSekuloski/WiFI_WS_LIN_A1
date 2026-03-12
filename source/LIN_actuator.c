@@ -7,7 +7,6 @@
 *
 *   Design goals:
 *     - Keep all LIN-specific logic outside web_server.c
-*     - Reuse the colleague's working LIN framing logic where appropriate
 *     - Replace blocking calibration loops with a simple runtime state machine
 *     - Provide rich UART debug output for bring-up without the real actuator
 *     - Provide a text status string suitable for Server-Sent Events (SSE)
@@ -46,7 +45,7 @@
  */
 #define LIN_EXCHANGE_PERIOD_MS                    (100u)
 
-/* Actuator status byte interpretation reused from colleague's code.
+/* Actuator status byte interpretation.
  * In the received response:
  *   - rx_data[2] must match 0x73 to identify the expected status payload
  *   - bits [2:1] of rx_data[4] indicate calibration progress
@@ -79,7 +78,7 @@
  *
  * Set to 0 when testing with the real actuator.
  */
-#define LIN_ACTUATOR_ENABLE_SIMULATION            (1u)
+#define LIN_ACTUATOR_ENABLE_SIMULATION            (0u)
 
 /* Task period used by the existing web server loop */
 #define LIN_TASK_CALL_PERIOD_MS                   (50u)
@@ -206,7 +205,7 @@ static void lin_set_debug_fmt(const char *fmt, ...)
  * Function Name: lin_prepare_command
  *******************************************************************************
  * Summary:
- *  Formats byte 0 of the 8-byte LIN payload according to the colleague's logic:
+ *  Formats byte 0 of the 8-byte LIN payload:
  *    - bits [1:0] contain the calibration command
  *    - bits [7:4] contain the flap position request
  *
@@ -458,9 +457,6 @@ static bool lin_request_and_read_status(void)
 
     Cy_SCB_ClearRxFifo(LIN_RX_SCB_INSTANCE);
 
-    /* The colleague's code waits between command and status request.
-     * Keep the same behavior for low-risk adaptation.
-     */
     cyhal_system_delay_ms(40);
     lin_send_header_request(LIN_STATUS_REQUEST_ID);
     cyhal_system_delay_ms(20);
@@ -494,8 +490,7 @@ static bool lin_request_and_read_status(void)
  * Function Name: lin_parse_expected_status
  *******************************************************************************
  * Summary:
- *  Parses the received actuator response according to the pattern already used
- *  in the colleague's code.
+ *  Parses the received actuator response.
  *
  * Parameters:
  *  closed_position_learned - output flag
