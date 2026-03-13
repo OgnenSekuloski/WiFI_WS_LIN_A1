@@ -61,10 +61,12 @@
 #include "cy_log.h"
 
 /* Standard C header file */
+#include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 
 #include "wifi_network_store.h"
+#include "display_status.h"
 
 #include "cy_network_mw_core.h"
 
@@ -85,38 +87,6 @@ static const cy_wcm_ip_setting_t ap_sta_mode_ip_settings =
     INITIALISER_IPV4_ADDRESS( .netmask,    SOFTAP_NETMASK),
     INITIALISER_IPV4_ADDRESS( .gateway,    SOFTAP_GATEWAY),
 };
-
-#ifdef ENABLE_TFT
-
-/* Global variable to hold display row position. */
-uint16_t row = TOP_DISPLAY;
-
-/* Row value to print light sensor voltage on TFT display. */
-uint16_t light_sensor_row_print = 0;
-
-/* Row value to print duty cycle on TFT display. */
-uint16_t duty_cycle_row_print = 0;
-
-/* Light sensor object. */
-extern mtb_light_sensor_t light_sensor_obj;
-
-/* Pin mapping used in TFT display */
-const mtb_st7789v_pins_t tft_pins =
-{
-    .db08 = CY8CKIT_028_TFT_PIN_DISPLAY_DB8,
-    .db09 = CY8CKIT_028_TFT_PIN_DISPLAY_DB9,
-    .db10 = CY8CKIT_028_TFT_PIN_DISPLAY_DB10,
-    .db11 = CY8CKIT_028_TFT_PIN_DISPLAY_DB11,
-    .db12 = CY8CKIT_028_TFT_PIN_DISPLAY_DB12,
-    .db13 = CY8CKIT_028_TFT_PIN_DISPLAY_DB13,
-    .db14 = CY8CKIT_028_TFT_PIN_DISPLAY_DB14,
-    .db15 = CY8CKIT_028_TFT_PIN_DISPLAY_DB15,
-    .nrd  = CY8CKIT_028_TFT_PIN_DISPLAY_NRD,
-    .nwr  = CY8CKIT_028_TFT_PIN_DISPLAY_NWR,
-    .dc   = CY8CKIT_028_TFT_PIN_DISPLAY_DC,
-    .rst  = CY8CKIT_028_TFT_PIN_DISPLAY_RST
-};
-#endif
 
 /* Holds the IP address and port number details of the socket for the HTTP server. */
 cy_socket_sockaddr_t http_server_ip_address;
@@ -209,6 +179,7 @@ static wifi_fail_reason_t classify_wifi_connect_failure(cy_rslt_t result_code);
 static const char* wifi_fail_reason_to_text(wifi_fail_reason_t reason);
 static cy_rslt_t start_sta_mdns_service(void);
 static void stop_sta_mdns_service(void);
+static void format_ipv4_address(uint32_t ip_addr, char *buffer, size_t buffer_len);
 
 static cyhal_gpio_callback_data_t provisioning_button_cb_data =
 {
@@ -297,6 +268,21 @@ static const char* wifi_fail_reason_to_text(wifi_fail_reason_t reason)
         default:
             return "unknown";
     }
+}
+
+/*******************************************************************************
+* Function Name: format_ipv4_address
+********************************************************************************
+* Summary:
+*  Converts a packed IPv4 address into dotted-decimal text.
+*******************************************************************************/
+static void format_ipv4_address(uint32_t ip_addr, char *buffer, size_t buffer_len)
+{
+    snprintf(buffer, buffer_len, "%u.%u.%u.%u",
+             (unsigned char)((ip_addr >> 0) & 0xff),
+             (unsigned char)((ip_addr >> 8) & 0xff),
+             (unsigned char)((ip_addr >> 16) & 0xff),
+             (unsigned char)((ip_addr >> 24) & 0xff));
 }
 
 /*******************************************************************************
@@ -698,6 +684,8 @@ void scan_for_available_aps(cy_http_response_stream_t *url_stream)
     result = cy_http_server_response_stream_write_payload(url_stream, WIFI_SCAN_IN_PROGRESS, sizeof(WIFI_SCAN_IN_PROGRESS));
     PRINT_AND_ASSERT(result, "Failed to send the HTTP POST response.\n");
 
+    display_status_show_scanning();
+
     result = cy_wcm_start_scan(scan_callback, NULL, NULL);
     PRINT_AND_ASSERT(result, "cy_wcm_start_scan failed.\n");
     
@@ -748,10 +736,6 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
     int8_t ssid_buff_index, buff_index = 0;
     cy_rslt_t result = CY_RSLT_SUCCESS;
     char *response = http_wifi_connect_response;
-
-#ifdef ENABLE_TFT
-    char display_buffer[DISPLAY_BUFFER_LENGTH] = {0};
-#endif /* #ifdef ENABLE_TFT */
 
     /* Reset parsed credential buffers so reprovisioning cannot keep stale tail bytes. */
     memset(wifi_ssid, 0, sizeof(wifi_ssid));
@@ -804,6 +788,8 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
         ERR_INFO(("Failed to send the HTTP POST response.\n"));
     }
 
+    display_status_show_connecting((const char *)wifi_ssid, 1u, MAX_WIFI_RETRY_COUNT);
+
     APP_INFO(("Exiting provisioning/AP mode.\r\n"));
     result = start_sta_mode();
     if (CY_RSLT_SUCCESS != result)
@@ -822,6 +808,8 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
             ERR_INFO(("Wi-Fi connection failure (%s) and fallback to provisioning/AP mode.\r\n",
                       wifi_fail_reason_to_text(last_wifi_fail_reason)));
         }
+        display_status_show_connect_failure((const char *)wifi_ssid,
+                                            wifi_fail_reason_to_text(last_wifi_fail_reason));
         sprintf(response, WIFI_CONNECT_RESPONSE_START);
         response += strlen(WIFI_CONNECT_RESPONSE_START);
         sprintf(response, WIFI_CONNECT_FAIL_RESPONSE_END);
@@ -860,16 +848,6 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
         {
             ERR_INFO(("Failed to store Wi-Fi network (0x%08lx).\r\n", (unsigned long)save_r));
         }
-
-#ifdef ENABLE_TFT
-    row += ROW_OFFSET;
-    GUI_DispStringAt("Connected to the Wi-Fi network: \r\n", 0, row);
-    row += ROW_OFFSET;
-    sprintf(display_buffer, " %s\r\n", wifi_ssid);
-    GUI_DispStringAt(display_buffer, 0, row);
-    row += ROW_OFFSET;
-#endif /* #ifdef ENABLE_TFT */
-
     }
     return result;
 }
@@ -913,6 +891,10 @@ cy_rslt_t start_ap_mode()
     /* Get IPV4 address for AP */
     result = cy_wcm_get_ip_addr(CY_WCM_INTERFACE_TYPE_AP, &ipv4_addr);
     PRINT_AND_ASSERT(result, "cy_wcm_get_ip_addr failed...! \n");
+
+    char ap_ip_text[DISPLAY_BUFFER_LENGTH];
+    format_ipv4_address(ipv4_addr.ip.v4, ap_ip_text, sizeof(ap_ip_text));
+    display_status_show_provisioning(SOFTAP_SSID, SOFTAP_PASSWORD, ap_ip_text, NULL);
 
     return result;
 }
@@ -963,6 +945,9 @@ cy_rslt_t start_sta_mode()
      */
     for (uint32_t conn_retries = 0; conn_retries < MAX_WIFI_RETRY_COUNT; conn_retries++)
     {
+        display_status_show_connecting((const char *)connect_param.ap_credentials.SSID,
+                                       conn_retries + 1u, MAX_WIFI_RETRY_COUNT);
+
         /* Allow provisioning button to interrupt STA connect attempts at any point. */
         handle_runtime_force_provisioning(SERVER_LOOP_PERIOD_MS);
         if (provisioning_button_force_mode_requested)
@@ -977,9 +962,15 @@ cy_rslt_t start_sta_mode()
         {
             APP_INFO(("Successful Wi-Fi connection: '%s'.\r\n", connect_param.ap_credentials.SSID));
             last_wifi_fail_reason = WIFI_FAIL_REASON_NONE;
+            char sta_ip_text[DISPLAY_BUFFER_LENGTH];
+            format_ipv4_address(ip_address.ip.v4, sta_ip_text, sizeof(sta_ip_text));
+            display_status_show_connect_success((const char *)connect_param.ap_credentials.SSID,
+                                                sta_ip_text, STA_MDNS_HOSTNAME ".local");
             break;
         }
         last_wifi_fail_reason = classify_wifi_connect_failure(result);
+        display_status_show_connect_failure((const char *)connect_param.ap_credentials.SSID,
+                                            wifi_fail_reason_to_text(last_wifi_fail_reason));
         ERR_INFO(("Wi-Fi connection attempt %lu/%lu failed (error %ld, reason=%s). Retrying in %lu ms...\r\n",
                   (unsigned long)(conn_retries + 1u),
                   (unsigned long)MAX_WIFI_RETRY_COUNT,
@@ -1420,6 +1411,7 @@ static cy_rslt_t start_provisioning_softap(void)
     cy_rslt_t result;
 
     APP_INFO(("Entering provisioning/AP mode.\r\n"));
+    display_status_show_boot("Provisioning requested", "Starting SoftAP server");
 
     /* Provisioning mode should not advertise STA mDNS hostname. */
     stop_sta_mdns_service();
@@ -1628,13 +1620,10 @@ void server_task(void *arg)
     char http_response[DEVICE_DATA_RESPONSE_LENGTH] = {0};
     char status_buffer[ACTUATOR_STATUS_BUFFER_LENGTH] = {0};
 
-#ifdef ENABLE_TFT
-    result = mtb_st7789v_init8(&tft_pins);
-    CY_ASSERT(result == CY_RSLT_SUCCESS);
-
-    /* Initialize and setup TFT display */
-    initialize_display();
-#endif /* ENABLE_TFT */
+#ifdef ENABLE_OLED
+    display_status_init();
+    display_status_show_boot("Booting device", "Initializing services");
+#endif /* ENABLE_OLED */
 
     /**************************************************************************
      * Initialize LIN actuator module once before entering the main loop.
@@ -1648,6 +1637,7 @@ void server_task(void *arg)
     /* Initialize the Wi-Fi device, transport, and lwIP network stack. */
     result = cy_wcm_init(&config);
     PRINT_AND_ASSERT(result, "cy_wcm_init failed...!\n");
+    display_status_show_boot("Wi-Fi stack ready", "Checking saved networks");
 
     /**************************************************************************
      * Runtime provisioning button + network store init
@@ -1681,6 +1671,7 @@ void server_task(void *arg)
 
         APP_INFO(("Boot: trying known network %lu/%lu: %s\r\n",
                   (unsigned long)(i + 1), (unsigned long)known_count, known[i].ssid));
+        display_status_show_known_network_attempt(known[i].ssid, i + 1u, known_count);
 
         result = start_sta_mode();
         if (result == CY_RSLT_SUCCESS)
@@ -1734,12 +1725,7 @@ void server_task(void *arg)
             lin_actuator_get_http_status(status_buffer, sizeof(status_buffer));
             snprintf(http_response, sizeof(http_response), "%s", status_buffer);
 
-#ifdef ENABLE_TFT
-            /* Optional: show LIN status on TFT. Keep this simple at first. */
-            GUI_Clear();
-            GUI_DispStringAt("LIN Actuator Control", 0, 0);
-            GUI_DispStringAt(status_buffer, 0, 20);
-#endif /* ENABLE_TFT */
+            display_status_show_sta_status(status_buffer);
 
             /* Send event stream update to browser */
             if (http_event_stream != NULL)
@@ -1790,37 +1776,6 @@ void server_task(void *arg)
     }
 }
 
-#ifdef ENABLE_TFT
-/*******************************************************************************
-* Function Name: initialize_display
-********************************************************************************
-* Summary:
-*  Task that initializes the TFT display and sets the foreground and background
-*  colour.
-*
-* Parameters:
-*  void
-*
-* Return:
-*  void
-*
-*******************************************************************************/
-void initialize_display(void)
-{
-    cy_rslt_t result = CY_RSLT_SUCCESS;
-
-    /* Initialize TFT */
-    result = GUI_Init();
-    PRINT_AND_ASSERT(result, "Failed to initialize TFT\n");
-
-    /* Set foreground and background color and font size */
-    GUI_SetFont(GUI_FONT_13B_1);
-    GUI_SetColor(GUI_WHITE);
-    GUI_SetBkColor(GUI_BLACK);
-    GUI_Clear();
-}
-#endif /* #ifdef ENABLE_TFT */
-
 /*******************************************************************************
 * Function Name: display_configuration
 ********************************************************************************
@@ -1839,13 +1794,9 @@ void display_configuration(void)
     cy_wcm_ip_address_t ip_address;
     cy_rslt_t result = CY_RSLT_SUCCESS;
 
-    uint32_t ip_addr;
     char display_ip_buffer[DISPLAY_BUFFER_LENGTH];
     char http_url[URL_LENGTH]={0};
-
-#ifdef ENABLE_TFT
-    char display_buffer[SENSOR_BUFFER_LENGTH];
-#endif /* #ifdef ENABLE_TFT */
+    const char *hostname = STA_MDNS_HOSTNAME ".local";
 
     if(reconfiguration_request == 0)
     {
@@ -1854,11 +1805,7 @@ void display_configuration(void)
         PRINT_AND_ASSERT(result, "Failed to retrieveSoftAP IP address\n");
 
         /*Print message to connect to that ip address*/
-        ip_addr = ip_address.ip.v4;
-        sprintf(display_ip_buffer, "%u.%u.%u.%u",  (unsigned char) ( ( ip_addr >> 0 ) & 0xff ),
-                (unsigned char) ( ( ip_addr >> 8 ) & 0xff ),
-                (unsigned char) ( ( ip_addr >> 16 ) & 0xff ),
-                (unsigned char) ( ( ip_addr >> 24 ) & 0xff ));
+        format_ipv4_address(ip_address.ip.v4, display_ip_buffer, sizeof(display_ip_buffer));
 
         sprintf(http_url, "http://%s:%d", display_ip_buffer, HTTP_PORT);
 
@@ -1872,30 +1819,7 @@ void display_configuration(void)
         APP_INFO(("perform a Wi-Fi scan to get the list of available APs.\r\n"));
         APP_INFO(("****************************************************************************\r\n"));
 
-#ifdef ENABLE_TFT
-        /* Display instructions text */
-        GUI_SetFont(GUI_FONT_16B_1);
-        GUI_DispString("***Wi-Fi Web Server - Provisioning***");
-        row +=ROW_OFFSET;
-        GUI_SetFont(GUI_FONT_13B_1);
-        GUI_DispStringAt("Using another device, connect to the following Wi-Fi \r\n", 0, row);
-        row +=ROW_OFFSET;
-        GUI_DispStringAt("network: \r\n", 0, row);
-        row +=ROW_OFFSET;
-        sprintf(display_buffer, "SSID: %s \r\n", SOFTAP_SSID);
-        GUI_DispStringAt(display_buffer, 0, row);
-        row +=ROW_OFFSET;
-        sprintf(display_buffer, "Password: %s \r\n", SOFTAP_PASSWORD);
-        GUI_DispStringAt(display_buffer, 0, row);
-        row +=ROW_OFFSET;   
-        GUI_DispStringAt("Open a web browser of your choice and enter the URL : \r\n", 0, row);
-        row +=ROW_OFFSET;
-        GUI_DispString(http_url);
-        row +=ROW_OFFSET;
-        GUI_DispStringAt("You can enter Wi-Fi network name and password directly ", 0, row);
-        row +=ROW_OFFSET;
-        GUI_DispStringAt("or perform a Wi-Fi scan to get the list of available APs.", 0, row);
-#endif /* #ifdef ENABLE_TFT */
+        display_status_show_provisioning(SOFTAP_SSID, SOFTAP_PASSWORD, display_ip_buffer, NULL);
     }
     else
     {
@@ -1906,11 +1830,7 @@ void display_configuration(void)
         PRINT_AND_ASSERT(result, "Failed to retrieveSoftAP IP address\n");
 
         /*Print message to connect to that ip address*/
-        ip_addr = ip_address.ip.v4;
-        sprintf(display_ip_buffer, "%u.%u.%u.%u",  (unsigned char) ( ( ip_addr >> 0 ) & 0xff ),
-                (unsigned char) ( ( ip_addr >> 8 ) & 0xff ),
-                (unsigned char) ( ( ip_addr >> 16 ) & 0xff ),
-                (unsigned char) ( ( ip_addr >> 24 ) & 0xff ));
+        format_ipv4_address(ip_address.ip.v4, display_ip_buffer, sizeof(display_ip_buffer));
                 
         sprintf(http_url, "http://%s:%d", display_ip_buffer, HTTP_PORT);
         
@@ -1925,35 +1845,13 @@ void display_configuration(void)
 #if LWIP_MDNS_RESPONDER
         APP_INFO(("Or use mDNS hostname URL      : http://%s.local/\r\n", STA_MDNS_HOSTNAME));
 #endif
-#ifdef ENABLE_TFT
+#ifdef ENABLE_OLED
         APP_INFO(("Use the webpage to monitor LIN actuator status updates.\r\n"));
-#endif /* #ifdef ENABLE_TFT */
+#endif /* ENABLE_OLED */
         APP_INFO(("Use the webpage controls to CALIBRATE, OPEN, or CLOSE the LIN actuator.\r\n"));
         APP_INFO(("******************************************************************\r\n"));
 
-#ifdef ENABLE_TFT
-        GUI_Clear();
-        row = TOP_DISPLAY;
-        GUI_SetFont(GUI_FONT_16B_1);
-        GUI_DispString("***Wi-Fi Web Server - Device Data***");
-        row += ROW_OFFSET;
-        GUI_SetFont(GUI_FONT_13B_1);
-        GUI_DispStringAt("On a device connected to the Wi-Fi network\r\n", 0, row);
-        row += ROW_OFFSET;
-        sprintf(display_buffer, "%s, \r\n", associated_ap_info.SSID);
-        GUI_DispStringAt(display_buffer, 0, row);
-        row += ROW_OFFSET;
-        GUI_DispStringAt("open a web browser and go to : \r\n", 0, row);
-        GUI_DispString(http_url);
-        row += ROW_OFFSET;
-        row += ROW_OFFSET;
-        light_sensor_row_print = row;
-        GUI_DispStringAt("LIN Actuator Status", 0, row);
-        row += ROW_OFFSET;
-        row += ROW_OFFSET;
-        duty_cycle_row_print = row;
-        GUI_DispStringAt("Last LIN Event", 0, row);
-#endif /* #ifdef ENABLE_TFT */
+        display_status_show_sta_ready((const char *)associated_ap_info.SSID, display_ip_buffer, hostname);
     }
 }
 

@@ -75,9 +75,8 @@ VERBOSE=
 # Advanced Configuration
 ################################################################################
 
-# Uncomment below DEFINES if you may use TFT feature on one of those boards:
-# CY8CKIT-062-WIFI-BT, CYW9P62S1-43438EVB-01, CY8CKIT-062S2-43012.
-# DEFINES+=ENABLE_TFT
+# Enable status output on the CY8CKIT-028-SENSE I2C OLED module.
+DEFINES+=ENABLE_OLED
 
 # Enable optional code that is ordinarily disabled by default.
 #
@@ -90,14 +89,6 @@ VERBOSE=
 # added to the build
 #
 COMPONENTS=FREERTOS LWIP MBEDTLS SECURE_SOCKETS
-
-ifeq ($(DEFINES), ENABLE_TFT)
-# Enable EMWIN_OSNTS component if TFT feature is enabled (ENABLE_TFT)
-    COMPONENTS+=EMWIN_OSNTS
-else
-# Ignore SEARCH_CY8CKIT-028-TFT if ENABLE_TFT is disabled
-    CY_IGNORE+=$(SEARCH_CY8CKIT-028-TFT)
-endif
 
 # Like COMPONENTS, but disable optional code that was enabled by default.
 DISABLE_COMPONENTS=

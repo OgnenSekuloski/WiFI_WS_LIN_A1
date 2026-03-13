@@ -51,15 +51,6 @@
 #include "html_web_page.h"
 #include "LIN_actuator.h"
 
-#ifdef ENABLE_TFT
-/* CY8CKIT-028-TFT shield and LCD library */
-#include "GUI.h"
-#include "mtb_st7789v.h"
-#include "cy8ckit_028_tft_pins.h"
-#include "mtb_light_sensor.h"
-#endif /* #ifdef ENABLE_TFT */
-
-
 /* Button used to force provisioning mode. Most BSPs define CYBSP_USER_BTN. */
 #ifndef PROVISION_FORCE_BUTTON
 #define PROVISION_FORCE_BUTTON   (CYBSP_USER_BTN)
@@ -140,14 +131,6 @@
 /* The delay in milliseconds between successive data upload.*/
 #define WIFI_DATA_UPLOAD_INTERVAL_MSEC               (50u)
 
-/* Initial row position on TFT display */
-#define TOP_DISPLAY                                  (0u)
-
-/* Offset row position on TFT display */
-#define ROW_OFFSET                                   (20)
-/* Offset row position on TFT display for displaying sensor value */
-#define SENSOR_DISPLAY_OFFSET                        (200)
-
 /* Macros used to format HTTP event stream sent from server to client */
 #define EVENT_STREAM_DATA                            "data: "
 #define LFLF                                         "\n\n"
@@ -197,7 +180,6 @@ cy_rslt_t start_sta_mode(void);
 cy_rslt_t start_ap_mode(void);
 void scan_for_available_aps(cy_http_response_stream_t *url_stream);
 void url_decode(char *dst, const uint8_t *src);
-void initialize_display(void);
 void display_configuration(void);
 cy_rslt_t configure_http_server(void);
 cy_rslt_t reconfigure_http_server(void);

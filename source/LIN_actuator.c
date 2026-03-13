@@ -78,7 +78,7 @@
  *
  * Set to 0 when testing with the real actuator.
  */
-#define LIN_ACTUATOR_ENABLE_SIMULATION            (0u)
+#define LIN_ACTUATOR_ENABLE_SIMULATION            (1u)
 
 /* Task period used by the existing web server loop */
 #define LIN_TASK_CALL_PERIOD_MS                   (50u)
@@ -172,6 +172,7 @@ static void lin_set_debug(const char *text)
 {
     memset(lin_ctx.last_debug, 0, sizeof(lin_ctx.last_debug));
     snprintf(lin_ctx.last_debug, sizeof(lin_ctx.last_debug), "%s", text);
+    printf("Info: LIN: %s\r\n", lin_ctx.last_debug);
 }
 
 /*******************************************************************************
