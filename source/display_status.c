@@ -579,26 +579,36 @@ void display_status_init(void)
     result = cyhal_i2c_init(&oled_i2c, CYBSP_I2C_SDA, CYBSP_I2C_SCL, NULL);
     if (result != CY_RSLT_SUCCESS)
     {
+        oled_ready = false;
+        printf("Info: Display not available. I2C init failed (0x%08lx). Continuing without OLED.\r\n",
+               (unsigned long)result);
         return;
     }
 
     result = cyhal_i2c_configure(&oled_i2c, &cfg);
     if (result != CY_RSLT_SUCCESS)
     {
+        oled_ready = false;
         cyhal_i2c_free(&oled_i2c);
+        printf("Info: Display not available. I2C configure failed (0x%08lx). Continuing without OLED.\r\n",
+               (unsigned long)result);
         return;
     }
 
     result = oled_write_commands(init_sequence, sizeof(init_sequence));
     if (result != CY_RSLT_SUCCESS)
     {
+        oled_ready = false;
         cyhal_i2c_free(&oled_i2c);
+        printf("Info: Display not detected on I2C address 0x%02X. Continuing without OLED.\r\n",
+               (unsigned int)OLED_I2C_ADDRESS);
         return;
     }
 
     oled_ready = true;
     oled_clear_buffer();
     (void)oled_flush();
+    printf("Info: OLED display detected and initialized.\r\n");
 }
 
 /*******************************************************************************
