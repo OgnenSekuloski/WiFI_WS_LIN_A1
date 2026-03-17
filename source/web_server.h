@@ -95,12 +95,12 @@
 #define HTTP_REQUEST_HANDLE_SUCCESS                  (0)
 #define HTTP_REQUEST_HANDLE_ERROR                    (-1)
 #define DEVICE_DATA_RESPONSE_LENGTH                  (sizeof(SOFTAP_DEVICE_DATA) + 64)
-#define WIFI_CONNECT_RESPONSE_LENGTH                 (sizeof(WIFI_CONNECT_RESPONSE_START) + sizeof(WIFI_CONNECT_SUCCESS_RESPONSE_END) + sizeof(WIFI_CONNECT_IN_PROGRESS) + 140)
 
 #define BUFFER_LENGTH                                (2048)
+#define WIFI_SCAN_LIST_BUFFER_LENGTH                 (4096)
 #define WIFI_SSID_LEN                                (32u)
 #define WIFI_PWD_LEN                                 (64u)
-#define MAX_WIFI_SCAN_HTTP_RESPONSE_LENGTH           (2048)
+#define MAX_WIFI_SCAN_HTTP_RESPONSE_LENGTH           (sizeof(SOFTAP_SCAN_START_RESPONSE) + sizeof(SOFTAP_SCAN_INTERMEDIATE_RESPONSE) + sizeof(SOFTAP_SCAN_END_RESPONSE) + WIFI_SCAN_LIST_BUFFER_LENGTH + 128u)
 
 #define SENSOR_BUFFER_LENGTH                         (128)
 #define ACTUATOR_STATUS_BUFFER_LENGTH               (256)
@@ -147,6 +147,14 @@
 
 #define SERVER_RECONFIGURE_REQUESTED                 (1u)
 #define SERVER_RECONFIGURED                          (2u)
+#define AP_SHUTDOWN_GRACE_PERIOD_MS                  (1500u)
+#define WIFI_MODE_SWITCH_SETTLE_MS                   (300u)
+#define WIFI_CONNECT_PAGE_SETTLE_MS                  (1200u)
+#define WIFI_CONNECT_TASK_STACK_SIZE                 (4096u)
+#define WIFI_CONNECT_TASK_PRIORITY                   (3u)
+#define STA_MDNS_RETRY_INTERVAL_MS                   (500u)
+#define STA_MDNS_REANNOUNCE_INTERVAL_MS              (1500u)
+#define STA_MDNS_REANNOUNCE_COUNT                    (3u)
 
 /* The size of the cy_wcm_ip_address_t array that is passed to
  * cy_wcm_get_ip_addr API. In the case of stand-alone AP or STA mode, the size of

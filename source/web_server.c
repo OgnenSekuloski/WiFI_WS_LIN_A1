@@ -113,7 +113,7 @@ uint8_t wifi_pwd[WIFI_PWD_LEN] = {0};
 char buffer[BUFFER_LENGTH] = {0};
 
 /* Holds the response handler for HTTP GET and POST request from the client 
-* to implement Wi-Fi scan and Wi-Fi connect funtionality. 
+* to implement Wi-Fi scan functionality. 
 */
 cy_resource_dynamic_data_t http_wifi_resource;
 
@@ -123,14 +123,24 @@ volatile bool scan_complete_flag = false;
 /* Flag to indicate if device has been configured. */
 volatile bool device_configured = false;
 
-/* Buffer to store ssid  */
-static char ssid_buff[BUFFER_LENGTH];
+/* Buffer to store scanned SSID list rendered into the provisioning page. */
+static char ssid_buff[WIFI_SCAN_LIST_BUFFER_LENGTH];
 
 /*Variable to indicate re-configuration request*/
 volatile int8_t reconfiguration_request = 0;
+static uint32_t pending_ap_shutdown_delay_ms = 0u;
+static TaskHandle_t wifi_connect_task_handle = NULL;
 
-/* Array to store Wi-Fi connect response. */
-static char http_wifi_connect_response[WIFI_CONNECT_RESPONSE_LENGTH] = {0};
+typedef enum
+{
+    WIFI_CONNECT_IDLE = 0,
+    WIFI_CONNECT_PENDING,
+    WIFI_CONNECT_RUNNING,
+    WIFI_CONNECT_SUCCESS,
+    WIFI_CONNECT_FAILED
+} wifi_connect_state_t;
+
+static volatile wifi_connect_state_t wifi_connect_state = WIFI_CONNECT_IDLE;
 
 /* Array to store Wi-Fi scan response. */
 static char http_scan_response[MAX_WIFI_SCAN_HTTP_RESPONSE_LENGTH] = {0};
@@ -170,6 +180,8 @@ static bool sta_mdns_initialized = false;
 static bool sta_mdns_active = false;
 static s8_t sta_mdns_http_service_slot = -1;
 static uint32_t sta_mdns_retry_elapsed_ms = 0u;
+static uint32_t sta_mdns_reannounce_elapsed_ms = 0u;
+static uint8_t sta_mdns_reannounce_remaining = 0u;
 #endif
 
 /* Forward declarations for runtime button/provisioning control. */
@@ -183,6 +195,9 @@ static void stop_sta_mdns_service(void);
 static void format_ipv4_address(uint32_t ip_addr, char *buffer, size_t buffer_len);
 static size_t append_text(char *dst, size_t dst_size, size_t offset, const char *src);
 static void service_sta_mdns_retry(uint32_t elapsed_ms);
+static void parse_wifi_credentials(const uint8_t *data, uint32_t data_len);
+static void wifi_connect_task(void *arg);
+static cy_rslt_t start_wifi_connect_task(void);
 
 static cyhal_gpio_callback_data_t provisioning_button_cb_data =
 {
@@ -217,6 +232,142 @@ static size_t append_text(char *dst, size_t dst_size, size_t offset, const char 
     }
 
     return offset + (size_t)written;
+}
+
+/*******************************************************************************
+* Function Name: parse_wifi_credentials
+********************************************************************************
+* Summary:
+*  Extracts SSID/password from the provisioning form POST body into the global
+*  credential buffers without attempting the connection yet.
+*******************************************************************************/
+static void parse_wifi_credentials(const uint8_t *data, uint32_t data_len)
+{
+    int8_t ssid_buff_index;
+    int8_t buff_index = 0;
+
+    memset(wifi_ssid, 0, sizeof(wifi_ssid));
+    memset(wifi_pwd, 0, sizeof(wifi_pwd));
+    memset(buffer, 0, sizeof(buffer));
+
+    url_decode(buffer, data);
+
+    if (!strncmp("SSID", buffer, 4))
+    {
+        while ((buffer[buff_index++] != EQUALS_OPERATOR_ASCII_VALUE))
+            ;
+
+        ssid_buff_index = 0;
+        while ((buffer[buff_index] != AMPERSAND_OPERATOR_ASCII_VALUE))
+        {
+            if (ssid_buff_index >= (WIFI_SSID_LEN - 1))
+            {
+                break;
+            }
+            wifi_ssid[ssid_buff_index++] = buffer[buff_index++];
+        }
+        wifi_ssid[ssid_buff_index] = '\0';
+
+        buff_index++;
+        while ((buffer[buff_index++] != EQUALS_OPERATOR_ASCII_VALUE))
+            ;
+
+        ssid_buff_index = 0;
+        while ((buff_index < data_len))
+        {
+            if (buffer[buff_index] == AMPERSAND_OPERATOR_ASCII_VALUE)
+            {
+                break;
+            }
+            if (ssid_buff_index >= (WIFI_PWD_LEN - 1))
+            {
+                break;
+            }
+
+            wifi_pwd[ssid_buff_index++] = buffer[buff_index++];
+        }
+        wifi_pwd[ssid_buff_index] = '\0';
+    }
+}
+
+static void wifi_connect_task(void *arg)
+{
+    cy_rslt_t result;
+
+    (void)arg;
+    wifi_connect_state = WIFI_CONNECT_RUNNING;
+    vTaskDelay(pdMS_TO_TICKS(WIFI_CONNECT_PAGE_SETTLE_MS));
+    display_status_show_connecting((const char *)wifi_ssid, 1u, MAX_WIFI_RETRY_COUNT);
+
+    APP_INFO(("Exiting provisioning/AP mode.\r\n"));
+    result = start_sta_mode();
+
+    if (CY_RSLT_SUCCESS == result)
+    {
+        cy_rslt_t save_r = wifi_store_save_network((const char*)wifi_ssid, (const char*)wifi_pwd);
+        if (save_r == CY_RSLT_SUCCESS)
+        {
+            APP_INFO(("Stored Wi-Fi network in internal flash.\r\n"));
+        }
+        else
+        {
+            ERR_INFO(("Failed to store Wi-Fi network (0x%08lx).\r\n", (unsigned long)save_r));
+        }
+        wifi_connect_state = WIFI_CONNECT_SUCCESS;
+        device_configured = true;
+        pending_ap_shutdown_delay_ms = AP_SHUTDOWN_GRACE_PERIOD_MS;
+    }
+    else
+    {
+        if (provisioning_button_force_mode_requested)
+        {
+            APP_INFO(("Wi-Fi connect canceled by button request; staying in provisioning/AP mode.\r\n"));
+            provisioning_button_force_mode_requested = false;
+        }
+        else if (last_wifi_fail_reason == WIFI_FAIL_REASON_AUTH_CREDENTIALS)
+        {
+            ERR_INFO(("Wi-Fi authentication failed. Check SSID/password and retry provisioning.\r\n"));
+        }
+        else
+        {
+            ERR_INFO(("Wi-Fi connection failure (%s) and fallback to provisioning/AP mode.\r\n",
+                      wifi_fail_reason_to_text(last_wifi_fail_reason)));
+        }
+
+        display_status_show_connect_failure((const char *)wifi_ssid,
+                                            wifi_fail_reason_to_text(last_wifi_fail_reason));
+        wifi_connect_state = WIFI_CONNECT_FAILED;
+    }
+
+    wifi_connect_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static cy_rslt_t start_wifi_connect_task(void)
+{
+    BaseType_t task_result;
+
+    if (wifi_connect_task_handle != NULL)
+    {
+        return CY_RSLT_SUCCESS;
+    }
+
+    wifi_connect_state = WIFI_CONNECT_PENDING;
+    task_result = xTaskCreate(wifi_connect_task,
+                              "wifi_connect",
+                              WIFI_CONNECT_TASK_STACK_SIZE,
+                              NULL,
+                              WIFI_CONNECT_TASK_PRIORITY,
+                              &wifi_connect_task_handle);
+    if (task_result != pdPASS)
+    {
+        wifi_connect_task_handle = NULL;
+        wifi_connect_state = WIFI_CONNECT_FAILED;
+        last_wifi_fail_reason = WIFI_FAIL_REASON_UNKNOWN;
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+    return CY_RSLT_SUCCESS;
 }
 
 /*******************************************************************************
@@ -347,6 +498,12 @@ static cy_rslt_t start_sta_mdns_service(void)
         return CY_RSLT_TYPE_ERROR;
     }
 
+    APP_INFO(("mDNS: attempting start on STA IP %u.%u.%u.%u\r\n",
+              (unsigned char)((sta_ip.ip.v4 >> 0) & 0xff),
+              (unsigned char)((sta_ip.ip.v4 >> 8) & 0xff),
+              (unsigned char)((sta_ip.ip.v4 >> 16) & 0xff),
+              (unsigned char)((sta_ip.ip.v4 >> 24) & 0xff)));
+
     LOCK_TCPIP_CORE();
 
     if (!sta_mdns_initialized)
@@ -393,6 +550,8 @@ static cy_rslt_t start_sta_mdns_service(void)
     mdns_resp_announce(sta_netif);
     sta_mdns_active = true;
     sta_mdns_retry_elapsed_ms = 0u;
+    sta_mdns_reannounce_elapsed_ms = 0u;
+    sta_mdns_reannounce_remaining = STA_MDNS_REANNOUNCE_COUNT;
     UNLOCK_TCPIP_CORE();
 
     APP_INFO(("mDNS started: http://%s.local/\r\n", STA_MDNS_HOSTNAME));
@@ -414,6 +573,8 @@ static void stop_sta_mdns_service(void)
     if (!sta_mdns_active)
     {
         sta_mdns_retry_elapsed_ms = 0u;
+        sta_mdns_reannounce_elapsed_ms = 0u;
+        sta_mdns_reannounce_remaining = 0u;
         return;
     }
 
@@ -424,6 +585,8 @@ static void stop_sta_mdns_service(void)
     {
         sta_mdns_http_service_slot = -1;
         sta_mdns_active = false;
+        sta_mdns_reannounce_elapsed_ms = 0u;
+        sta_mdns_reannounce_remaining = 0u;
         return;
     }
 
@@ -433,6 +596,8 @@ static void stop_sta_mdns_service(void)
     sta_mdns_active = false;
     UNLOCK_TCPIP_CORE();
     sta_mdns_retry_elapsed_ms = 0u;
+    sta_mdns_reannounce_elapsed_ms = 0u;
+    sta_mdns_reannounce_remaining = 0u;
 #endif
 }
 
@@ -446,28 +611,54 @@ static void stop_sta_mdns_service(void)
 static void service_sta_mdns_retry(uint32_t elapsed_ms)
 {
 #if LWIP_MDNS_RESPONDER
-    if (sta_mdns_active || (reconfiguration_request != SERVER_RECONFIGURED))
+    if (reconfiguration_request != SERVER_RECONFIGURED)
     {
         sta_mdns_retry_elapsed_ms = 0u;
+        sta_mdns_reannounce_elapsed_ms = 0u;
         return;
     }
 
     if (!cy_wcm_is_connected_to_ap())
     {
         sta_mdns_retry_elapsed_ms = 0u;
+        sta_mdns_reannounce_elapsed_ms = 0u;
         return;
     }
 
-    sta_mdns_retry_elapsed_ms += elapsed_ms;
-    if (sta_mdns_retry_elapsed_ms < 1000u)
+    if (!sta_mdns_active)
     {
+        sta_mdns_retry_elapsed_ms += elapsed_ms;
+        if (sta_mdns_retry_elapsed_ms < STA_MDNS_RETRY_INTERVAL_MS)
+        {
+            return;
+        }
+
+        sta_mdns_retry_elapsed_ms = 0u;
+        if (start_sta_mdns_service() != CY_RSLT_SUCCESS)
+        {
+            ERR_INFO(("mDNS retry failed; will retry again.\r\n"));
+        }
         return;
     }
 
-    sta_mdns_retry_elapsed_ms = 0u;
-    if (start_sta_mdns_service() != CY_RSLT_SUCCESS)
+    if (sta_mdns_reannounce_remaining > 0u)
     {
-        ERR_INFO(("mDNS retry failed; will retry again.\r\n"));
+        struct netif *sta_netif =
+            (struct netif *)cy_network_get_nw_interface(CY_NETWORK_WIFI_STA_INTERFACE, 0u);
+
+        sta_mdns_reannounce_elapsed_ms += elapsed_ms;
+        if ((sta_netif != NULL) &&
+            (sta_mdns_reannounce_elapsed_ms >= STA_MDNS_REANNOUNCE_INTERVAL_MS))
+        {
+            LOCK_TCPIP_CORE();
+            mdns_resp_announce(sta_netif);
+            UNLOCK_TCPIP_CORE();
+
+            sta_mdns_reannounce_elapsed_ms = 0u;
+            sta_mdns_reannounce_remaining--;
+            APP_INFO(("mDNS re-announce sent, remaining=%u\r\n",
+                      (unsigned int)sta_mdns_reannounce_remaining));
+        }
     }
 #else
     (void)elapsed_ms;
@@ -576,10 +767,18 @@ int32_t softap_resource_handler(const char *url_path,
 
         if(!device_configured)
         {
-            /* The device tries to connect to the AP using the credentials sent via HTTP
-             * webpage.
-             */
-            result = wifi_extract_credentials(http_message_body->data, http_message_body->data_length,stream);
+            parse_wifi_credentials(http_message_body->data, http_message_body->data_length);
+            result = start_wifi_connect_task();
+            if (CY_RSLT_SUCCESS == result)
+            {
+                result = cy_http_server_response_stream_write_payload(stream,
+                                                                      WIFI_CONNECT_IN_PROGRESS,
+                                                                      sizeof(WIFI_CONNECT_IN_PROGRESS) - 1);
+            }
+            if (CY_RSLT_SUCCESS != result)
+            {
+                ERR_INFO(("Failed to send the HTTP POST response.\n"));
+            }
         }
         else
         {
@@ -668,23 +867,6 @@ static int32_t wifi_resource_handler(const char *url_path,
         /* Scan for the available networks in response to the HTTP GET request. */
         scan_for_available_aps(stream);
         
-        break;
-
-    case CY_HTTP_REQUEST_POST:
-
-        /* The device tries to connect to the AP using the credentials sent via HTTP
-         * webpage.
-         */
-        result = cy_http_server_response_stream_write_payload(stream, HTTP_DEVICE_DATA_REDIRECT_WEBPAGE, sizeof(HTTP_DEVICE_DATA_REDIRECT_WEBPAGE));
-        if (CY_RSLT_SUCCESS != result)
-        {
-            ERR_INFO(("Failed to send the HTTP POST response.\n"));
-        }
-
-        /* Set device configured flag to true */
-        device_configured = true;
-        reconfiguration_request = SERVER_RECONFIGURE_REQUESTED;
-        cy_wcm_stop_ap();
         break;
 
     default:
@@ -784,9 +966,6 @@ void scan_for_available_aps(cy_http_response_stream_t *url_stream)
     memset(http_scan_response, 0, sizeof(http_scan_response));
     scan_complete_flag = false;
 
-    result = cy_http_server_response_stream_write_payload(url_stream, WIFI_SCAN_IN_PROGRESS, sizeof(WIFI_SCAN_IN_PROGRESS));
-    PRINT_AND_ASSERT(result, "Failed to send the HTTP POST response.\n");
-
     display_status_show_scanning();
 
     result = cy_wcm_start_scan(scan_callback, NULL, NULL);
@@ -832,128 +1011,6 @@ void scan_for_available_aps(cy_http_response_stream_t *url_stream)
  *  void
  *
  *******************************************************************************/
-cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_http_response_stream_t *stream)
-{
-    int8_t ssid_buff_index, buff_index = 0;
-    cy_rslt_t result = CY_RSLT_SUCCESS;
-    size_t response_len = 0u;
-
-    /* Reset parsed credential buffers so reprovisioning cannot keep stale tail bytes. */
-    memset(wifi_ssid, 0, sizeof(wifi_ssid));
-    memset(wifi_pwd, 0, sizeof(wifi_pwd));
-    memset(buffer, 0, sizeof(buffer));
-    memset(http_wifi_connect_response, 0, sizeof(http_wifi_connect_response));
-
-    /*decode the url encoded data using the function url_decode()*/
-    url_decode(buffer, data);
-
-    if (!strncmp("SSID", buffer, 4))
-    {
-        /* Extract SSID and Password - skip to SSID*/
-        while ((buffer[buff_index++] != EQUALS_OPERATOR_ASCII_VALUE))
-            ;
-
-        ssid_buff_index = 0;
-        /*skip '&' */
-        while ((buffer[buff_index] != AMPERSAND_OPERATOR_ASCII_VALUE))
-        {
-            if (ssid_buff_index >= (WIFI_SSID_LEN - 1))
-            {
-                break;
-            }
-            wifi_ssid[ssid_buff_index++] = buffer[buff_index++];
-        }
-        wifi_ssid[ssid_buff_index] = '\0';
-
-        buff_index++;
-        /* skip to Password */
-        while ((buffer[buff_index++] != EQUALS_OPERATOR_ASCII_VALUE ))
-            ;
-
-        ssid_buff_index = 0;
-        while ((buff_index < data_len))
-        {
-            if (buffer[buff_index] == AMPERSAND_OPERATOR_ASCII_VALUE)
-                break;
-            if (ssid_buff_index >= (WIFI_PWD_LEN - 1))
-            {
-                break;
-            }
-
-            wifi_pwd[ssid_buff_index++] = buffer[buff_index++];
-        }
-        wifi_pwd[ssid_buff_index] = '\0';
-    }
-    result = cy_http_server_response_stream_write_payload(stream, WIFI_CONNECT_IN_PROGRESS, sizeof(WIFI_CONNECT_IN_PROGRESS));
-    if (CY_RSLT_SUCCESS != result)
-    {
-        ERR_INFO(("Failed to send the HTTP POST response.\n"));
-    }
-
-    display_status_show_connecting((const char *)wifi_ssid, 1u, MAX_WIFI_RETRY_COUNT);
-
-    APP_INFO(("Exiting provisioning/AP mode.\r\n"));
-    result = start_sta_mode();
-    if (CY_RSLT_SUCCESS != result)
-    {
-        if (provisioning_button_force_mode_requested)
-        {
-            APP_INFO(("Wi-Fi connect canceled by button request; staying in provisioning/AP mode.\r\n"));
-            provisioning_button_force_mode_requested = false;
-        }
-        else if (last_wifi_fail_reason == WIFI_FAIL_REASON_AUTH_CREDENTIALS)
-        {
-            ERR_INFO(("Wi-Fi authentication failed. Check SSID/password and retry provisioning.\r\n"));
-        }
-        else
-        {
-            ERR_INFO(("Wi-Fi connection failure (%s) and fallback to provisioning/AP mode.\r\n",
-                      wifi_fail_reason_to_text(last_wifi_fail_reason)));
-        }
-        display_status_show_connect_failure((const char *)wifi_ssid,
-                                            wifi_fail_reason_to_text(last_wifi_fail_reason));
-        response_len = append_text(http_wifi_connect_response, sizeof(http_wifi_connect_response),
-                                   response_len, WIFI_CONNECT_RESPONSE_START);
-        response_len = append_text(http_wifi_connect_response, sizeof(http_wifi_connect_response),
-                                   response_len, WIFI_CONNECT_FAIL_RESPONSE_END);
-        result = cy_http_server_response_stream_write_payload(stream, http_wifi_connect_response, response_len);
-        if (CY_RSLT_SUCCESS != result)
-        {
-            ERR_INFO(("Failed to send the HTTP POST response.\n"));
-        }
-    }
-    else
-    {
-        response_len = append_text(http_wifi_connect_response, sizeof(http_wifi_connect_response),
-                                   response_len, WIFI_CONNECT_RESPONSE_START);
-        response_len = append_text(http_wifi_connect_response, sizeof(http_wifi_connect_response),
-                                   response_len, WIFI_CONNECT_SUCCESS_RESPONSE_END);
-        result = cy_http_server_response_stream_write_payload(stream, http_wifi_connect_response, response_len);
-        if (CY_RSLT_SUCCESS != result)
-        {
-            ERR_INFO(("Failed to send the HTTP POST response.\n"));
-        }
-
-        /**********************************************************************
-         * Phase 1: Store Wi-Fi network into internal flash
-         **********************************************************************
-         * Summary:
-         *  Store the SSID/PWD so future boots can skip provisioning.
-         *  If storage is full, the store will evict the least recently used.
-         *********************************************************************/
-        cy_rslt_t save_r = wifi_store_save_network((const char*)wifi_ssid, (const char*)wifi_pwd);
-        if (save_r == CY_RSLT_SUCCESS)
-        {
-            APP_INFO(("Stored Wi-Fi network in internal flash.\r\n"));
-        }
-        else
-        {
-            ERR_INFO(("Failed to store Wi-Fi network (0x%08lx).\r\n", (unsigned long)save_r));
-        }
-    }
-    return result;
-}
-
 /********************************************************************************
  * Function Name: start_ap_mode
  ********************************************************************************
@@ -1063,6 +1120,11 @@ cy_rslt_t start_sta_mode()
         if (result == CY_RSLT_SUCCESS)
         {
             APP_INFO(("Successful Wi-Fi connection: '%s'.\r\n", connect_param.ap_credentials.SSID));
+            APP_INFO(("STA IP acquired: %u.%u.%u.%u\r\n",
+                      (unsigned char)((ip_address.ip.v4 >> 0) & 0xff),
+                      (unsigned char)((ip_address.ip.v4 >> 8) & 0xff),
+                      (unsigned char)((ip_address.ip.v4 >> 16) & 0xff),
+                      (unsigned char)((ip_address.ip.v4 >> 24) & 0xff)));
             last_wifi_fail_reason = WIFI_FAIL_REASON_NONE;
             char sta_ip_text[DISPLAY_BUFFER_LENGTH];
             format_ipv4_address(ip_address.ip.v4, sta_ip_text, sizeof(sta_ip_text));
@@ -1256,6 +1318,12 @@ cy_rslt_t configure_http_server_sta_only(void)
     /* Start STA server */
     result = cy_http_server_start(http_sta_server);
     PRINT_AND_ASSERT(result, "Failed to start STA HTTP server.\n");
+    APP_INFO(("STA HTTP server started on %u.%u.%u.%u:%u\r\n",
+              (unsigned char)((ip_addr.ip.v4 >> 0) & 0xff),
+              (unsigned char)((ip_addr.ip.v4 >> 8) & 0xff),
+              (unsigned char)((ip_addr.ip.v4 >> 16) & 0xff),
+              (unsigned char)((ip_addr.ip.v4 >> 24) & 0xff),
+              (unsigned int)HTTP_PORT));
 
     /* Advertise STA web UI hostname on LAN via mDNS. */
     cy_rslt_t mdns_result = start_sta_mdns_service();
@@ -1353,6 +1421,12 @@ cy_rslt_t reconfigure_http_server(void)
     /* Start the HTTP server. */
     result = cy_http_server_start(http_sta_server);
     PRINT_AND_ASSERT(result, "Failed to start the HTTP server.\n");
+    APP_INFO(("STA HTTP server reconfigured on %u.%u.%u.%u:%u\r\n",
+              (unsigned char)((ip_addr.ip.v4 >> 0) & 0xff),
+              (unsigned char)((ip_addr.ip.v4 >> 8) & 0xff),
+              (unsigned char)((ip_addr.ip.v4 >> 16) & 0xff),
+              (unsigned char)((ip_addr.ip.v4 >> 24) & 0xff),
+              (unsigned int)HTTP_PORT));
 
     /* Advertise STA web UI hostname on LAN via mDNS. */
     cy_rslt_t mdns_result = start_sta_mdns_service();
@@ -1521,7 +1595,21 @@ static cy_rslt_t start_provisioning_softap(void)
     /* Reset provisioning state variables */
     device_configured = false;
     reconfiguration_request = 0;
+    pending_ap_shutdown_delay_ms = 0u;
+    wifi_connect_state = WIFI_CONNECT_IDLE;
+    wifi_connect_task_handle = NULL;
     http_event_stream = NULL;
+
+    /* When bouncing back into provisioning from STA mode, give the Wi-Fi
+     * firmware a moment to settle before starting SoftAP again.
+     */
+    if (cy_wcm_is_connected_to_ap())
+    {
+        (void)cy_wcm_disconnect_ap();
+        vTaskDelay(pdMS_TO_TICKS(WIFI_MODE_SWITCH_SETTLE_MS));
+    }
+    (void)cy_wcm_stop_ap();
+    vTaskDelay(pdMS_TO_TICKS(WIFI_MODE_SWITCH_SETTLE_MS));
 
     /* Start SoftAP */
     result = start_ap_mode();
@@ -1873,6 +1961,22 @@ void server_task(void *arg)
             reconfigure_http_server();
             display_configuration();
             reconfiguration_request = SERVER_RECONFIGURED;
+        }
+
+        if ((pending_ap_shutdown_delay_ms > 0u) &&
+            (SERVER_RECONFIGURE_REQUESTED != reconfiguration_request) &&
+            (SERVER_RECONFIGURED != reconfiguration_request))
+        {
+            if (pending_ap_shutdown_delay_ms > SERVER_LOOP_PERIOD_MS)
+            {
+                pending_ap_shutdown_delay_ms -= SERVER_LOOP_PERIOD_MS;
+            }
+            else
+            {
+                pending_ap_shutdown_delay_ms = 0u;
+                reconfiguration_request = SERVER_RECONFIGURE_REQUESTED;
+                (void)cy_wcm_stop_ap();
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(SERVER_LOOP_PERIOD_MS));
