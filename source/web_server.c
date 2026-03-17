@@ -169,6 +169,7 @@ static volatile wifi_fail_reason_t last_wifi_fail_reason = WIFI_FAIL_REASON_NONE
 static bool sta_mdns_initialized = false;
 static bool sta_mdns_active = false;
 static s8_t sta_mdns_http_service_slot = -1;
+static uint32_t sta_mdns_retry_elapsed_ms = 0u;
 #endif
 
 /* Forward declarations for runtime button/provisioning control. */
@@ -180,12 +181,43 @@ static const char* wifi_fail_reason_to_text(wifi_fail_reason_t reason);
 static cy_rslt_t start_sta_mdns_service(void);
 static void stop_sta_mdns_service(void);
 static void format_ipv4_address(uint32_t ip_addr, char *buffer, size_t buffer_len);
+static size_t append_text(char *dst, size_t dst_size, size_t offset, const char *src);
+static void service_sta_mdns_retry(uint32_t elapsed_ms);
 
 static cyhal_gpio_callback_data_t provisioning_button_cb_data =
 {
     .callback = provisioning_button_isr_callback,
     .callback_arg = NULL
 };
+
+/*******************************************************************************
+* Function Name: append_text
+********************************************************************************
+* Summary:
+*  Appends a NUL-terminated string into a bounded destination buffer.
+*******************************************************************************/
+static size_t append_text(char *dst, size_t dst_size, size_t offset, const char *src)
+{
+    int written;
+
+    if ((dst == NULL) || (src == NULL) || (offset >= dst_size))
+    {
+        return offset;
+    }
+
+    written = snprintf(dst + offset, dst_size - offset, "%s", src);
+    if (written < 0)
+    {
+        return offset;
+    }
+
+    if ((size_t)written >= (dst_size - offset))
+    {
+        return dst_size - 1u;
+    }
+
+    return offset + (size_t)written;
+}
 
 /*******************************************************************************
 * Function Name: is_provisioning_ap_active
@@ -299,12 +331,19 @@ static void format_ipv4_address(uint32_t ip_addr, char *buffer, size_t buffer_le
 static cy_rslt_t start_sta_mdns_service(void)
 {
 #if LWIP_MDNS_RESPONDER
+    cy_wcm_ip_address_t sta_ip;
     struct netif *sta_netif =
         (struct netif *)cy_network_get_nw_interface(CY_NETWORK_WIFI_STA_INTERFACE, 0u);
 
     if (sta_netif == NULL)
     {
         ERR_INFO(("mDNS: STA netif handle is NULL.\r\n"));
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+    if (cy_wcm_get_ip_addr(CY_WCM_INTERFACE_TYPE_STA, &sta_ip) != CY_RSLT_SUCCESS)
+    {
+        ERR_INFO(("mDNS: STA IP address not ready yet.\r\n"));
         return CY_RSLT_TYPE_ERROR;
     }
 
@@ -342,12 +381,18 @@ static cy_rslt_t start_sta_mdns_service(void)
 
     if (sta_mdns_http_service_slot < 0)
     {
+        (void)mdns_resp_remove_netif(sta_netif);
+        sta_mdns_http_service_slot = -1;
+        sta_mdns_active = false;
+        UNLOCK_TCPIP_CORE();
         ERR_INFO(("mDNS: HTTP service registration failed (slot=%d).\r\n",
                   (int)sta_mdns_http_service_slot));
+        return CY_RSLT_TYPE_ERROR;
     }
 
     mdns_resp_announce(sta_netif);
     sta_mdns_active = true;
+    sta_mdns_retry_elapsed_ms = 0u;
     UNLOCK_TCPIP_CORE();
 
     APP_INFO(("mDNS started: http://%s.local/\r\n", STA_MDNS_HOSTNAME));
@@ -368,6 +413,7 @@ static void stop_sta_mdns_service(void)
 #if LWIP_MDNS_RESPONDER
     if (!sta_mdns_active)
     {
+        sta_mdns_retry_elapsed_ms = 0u;
         return;
     }
 
@@ -386,6 +432,45 @@ static void stop_sta_mdns_service(void)
     sta_mdns_http_service_slot = -1;
     sta_mdns_active = false;
     UNLOCK_TCPIP_CORE();
+    sta_mdns_retry_elapsed_ms = 0u;
+#endif
+}
+
+/*******************************************************************************
+* Function Name: service_sta_mdns_retry
+********************************************************************************
+* Summary:
+*  Retries mDNS startup in STA mode when a previous attempt failed because the
+*  interface or IP address was not ready yet.
+*******************************************************************************/
+static void service_sta_mdns_retry(uint32_t elapsed_ms)
+{
+#if LWIP_MDNS_RESPONDER
+    if (sta_mdns_active || (reconfiguration_request != SERVER_RECONFIGURED))
+    {
+        sta_mdns_retry_elapsed_ms = 0u;
+        return;
+    }
+
+    if (!cy_wcm_is_connected_to_ap())
+    {
+        sta_mdns_retry_elapsed_ms = 0u;
+        return;
+    }
+
+    sta_mdns_retry_elapsed_ms += elapsed_ms;
+    if (sta_mdns_retry_elapsed_ms < 1000u)
+    {
+        return;
+    }
+
+    sta_mdns_retry_elapsed_ms = 0u;
+    if (start_sta_mdns_service() != CY_RSLT_SUCCESS)
+    {
+        ERR_INFO(("mDNS retry failed; will retry again.\r\n"));
+    }
+#else
+    (void)elapsed_ms;
 #endif
 }
 
@@ -634,31 +719,46 @@ static int32_t wifi_resource_handler(const char *url_path,
  ******************************************************************************/
 void scan_callback(cy_wcm_scan_result_t *result_ptr, void *user_data, cy_wcm_scan_status_t status)
 {
-    char *network_name = ssid_buff;
     static uint32_t len = 0;
-    
-    if ((strlen((const char *)result_ptr->SSID) != 0) && (status == CY_WCM_SCAN_INCOMPLETE))
-    {
 
-        network_name += len;
-        memcpy(network_name, result_ptr->SSID, strlen((char *)result_ptr->SSID));
-        len += strlen((char *)result_ptr->SSID);
-        memcpy((network_name + strlen((char *)result_ptr->SSID)), "\n", 1);
-        len++;
-        scan_complete_flag = false;
+    (void)user_data;
+
+    if ((status == CY_WCM_SCAN_INCOMPLETE) && (result_ptr != NULL))
+    {
+        size_t ssid_len = strnlen((const char *)result_ptr->SSID, WIFI_SSID_LEN);
+
+        if ((ssid_len != 0u) && (len < (sizeof(ssid_buff) - 1u)))
+        {
+            size_t remaining = (sizeof(ssid_buff) - 1u) - len;
+
+            if (ssid_len > remaining)
+            {
+                ssid_len = remaining;
+            }
+
+            memcpy(&ssid_buff[len], result_ptr->SSID, ssid_len);
+            len += (uint32_t)ssid_len;
+
+            if (len < (sizeof(ssid_buff) - 1u))
+            {
+                ssid_buff[len++] = '\n';
+            }
+
+            ssid_buff[len] = '\0';
+        }
     }
 
     if ((CY_WCM_SCAN_COMPLETE == status))
     {
-        /* Reset the number of scan results to 0 for the next scan.*/
-        len++;
-        memcpy((ssid_buff + len), "\0", 1);
-        len = 0;
-        
         /* Flag to notify that scan has completed.*/
-        scan_complete_flag = true;        
+        if (len >= sizeof(ssid_buff))
+        {
+            len = sizeof(ssid_buff) - 1u;
+        }
+        ssid_buff[len] = '\0';
+        scan_complete_flag = true;
+        len = 0;
     }
-
 }
 
 /*******************************************************************************
@@ -678,8 +778,11 @@ void scan_callback(cy_wcm_scan_result_t *result_ptr, void *user_data, cy_wcm_sca
 void scan_for_available_aps(cy_http_response_stream_t *url_stream)
 {
     cy_rslt_t result = CY_RSLT_SUCCESS;
+    size_t response_len = 0u;
 
-    char *response = http_scan_response;
+    memset(ssid_buff, 0, sizeof(ssid_buff));
+    memset(http_scan_response, 0, sizeof(http_scan_response));
+    scan_complete_flag = false;
 
     result = cy_http_server_response_stream_write_payload(url_stream, WIFI_SCAN_IN_PROGRESS, sizeof(WIFI_SCAN_IN_PROGRESS));
     PRINT_AND_ASSERT(result, "Failed to send the HTTP POST response.\n");
@@ -695,19 +798,17 @@ void scan_for_available_aps(cy_http_response_stream_t *url_stream)
         vTaskDelay(pdMS_TO_TICKS(SCAN_DELAY_MS));
     }
 
-    scan_complete_flag = false;
-
     /* Print the scan result in webpage.*/
-    sprintf(response, SOFTAP_SCAN_START_RESPONSE);
-    response += strlen(SOFTAP_SCAN_START_RESPONSE);
-    memcpy(response, ssid_buff, strlen(ssid_buff));
-    response += strlen(ssid_buff);
-    sprintf(response, SOFTAP_SCAN_INTERMEDIATE_RESPONSE);
-    response += strlen(SOFTAP_SCAN_INTERMEDIATE_RESPONSE);
-    sprintf(response, SOFTAP_SCAN_END_RESPONSE);
-    response += strlen(SOFTAP_SCAN_END_RESPONSE); 
-    
-    result = cy_http_server_response_stream_write_payload(url_stream, http_scan_response, sizeof(http_scan_response) - 1);
+    response_len = append_text(http_scan_response, sizeof(http_scan_response), response_len,
+                               SOFTAP_SCAN_START_RESPONSE);
+    response_len = append_text(http_scan_response, sizeof(http_scan_response), response_len,
+                               ssid_buff);
+    response_len = append_text(http_scan_response, sizeof(http_scan_response), response_len,
+                               SOFTAP_SCAN_INTERMEDIATE_RESPONSE);
+    response_len = append_text(http_scan_response, sizeof(http_scan_response), response_len,
+                               SOFTAP_SCAN_END_RESPONSE);
+
+    result = cy_http_server_response_stream_write_payload(url_stream, http_scan_response, response_len);
     if (CY_RSLT_SUCCESS != result)
     {
         ERR_INFO(("Failed to write HTTP response\r\n"));
@@ -735,12 +836,13 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
 {
     int8_t ssid_buff_index, buff_index = 0;
     cy_rslt_t result = CY_RSLT_SUCCESS;
-    char *response = http_wifi_connect_response;
+    size_t response_len = 0u;
 
     /* Reset parsed credential buffers so reprovisioning cannot keep stale tail bytes. */
     memset(wifi_ssid, 0, sizeof(wifi_ssid));
     memset(wifi_pwd, 0, sizeof(wifi_pwd));
     memset(buffer, 0, sizeof(buffer));
+    memset(http_wifi_connect_response, 0, sizeof(http_wifi_connect_response));
 
     /*decode the url encoded data using the function url_decode()*/
     url_decode(buffer, data);
@@ -810,11 +912,11 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
         }
         display_status_show_connect_failure((const char *)wifi_ssid,
                                             wifi_fail_reason_to_text(last_wifi_fail_reason));
-        sprintf(response, WIFI_CONNECT_RESPONSE_START);
-        response += strlen(WIFI_CONNECT_RESPONSE_START);
-        sprintf(response, WIFI_CONNECT_FAIL_RESPONSE_END);
-        response += strlen(WIFI_CONNECT_FAIL_RESPONSE_END);
-        result = cy_http_server_response_stream_write_payload(stream, http_wifi_connect_response, sizeof(http_wifi_connect_response));
+        response_len = append_text(http_wifi_connect_response, sizeof(http_wifi_connect_response),
+                                   response_len, WIFI_CONNECT_RESPONSE_START);
+        response_len = append_text(http_wifi_connect_response, sizeof(http_wifi_connect_response),
+                                   response_len, WIFI_CONNECT_FAIL_RESPONSE_END);
+        result = cy_http_server_response_stream_write_payload(stream, http_wifi_connect_response, response_len);
         if (CY_RSLT_SUCCESS != result)
         {
             ERR_INFO(("Failed to send the HTTP POST response.\n"));
@@ -822,11 +924,11 @@ cy_rslt_t wifi_extract_credentials(const uint8_t *data, uint32_t data_len, cy_ht
     }
     else
     {
-        sprintf(response, WIFI_CONNECT_RESPONSE_START);
-        response += strlen(WIFI_CONNECT_RESPONSE_START);
-        sprintf(response, WIFI_CONNECT_SUCCESS_RESPONSE_END);
-        response += strlen(WIFI_CONNECT_SUCCESS_RESPONSE_END);
-        result = cy_http_server_response_stream_write_payload(stream, http_wifi_connect_response, sizeof(http_wifi_connect_response));
+        response_len = append_text(http_wifi_connect_response, sizeof(http_wifi_connect_response),
+                                   response_len, WIFI_CONNECT_RESPONSE_START);
+        response_len = append_text(http_wifi_connect_response, sizeof(http_wifi_connect_response),
+                                   response_len, WIFI_CONNECT_SUCCESS_RESPONSE_END);
+        result = cy_http_server_response_stream_write_payload(stream, http_wifi_connect_response, response_len);
         if (CY_RSLT_SUCCESS != result)
         {
             ERR_INFO(("Failed to send the HTTP POST response.\n"));
@@ -1715,6 +1817,7 @@ void server_task(void *arg)
     {
         /* Runtime long-press check in all modes (AP provisioning + STA). */
         handle_runtime_force_provisioning(SERVER_LOOP_PERIOD_MS);
+        service_sta_mdns_retry(SERVER_LOOP_PERIOD_MS);
 
         if (SERVER_RECONFIGURED == reconfiguration_request)
         {
