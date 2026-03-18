@@ -827,7 +827,7 @@ cy_rslt_t lin_actuator_init(void)
  *******************************************************************************/
 void lin_actuator_task(void)
 {
-    __disable_irq();
+    // __disable_irq();
     if (!lin_ctx.initialized)
     {
         return;
@@ -846,7 +846,7 @@ void lin_actuator_task(void)
 
     lin_execute_state_machine_step();
 
-    __enable_irq();
+    // __enable_irq();
 }
 
 /*******************************************************************************
