@@ -78,7 +78,7 @@
  *
  * Set to 0 when testing with the real actuator.
  */
-#define LIN_ACTUATOR_ENABLE_SIMULATION            (1u)
+#define LIN_ACTUATOR_ENABLE_SIMULATION            (0u)
 
 /* Task period used by the existing web server loop */
 #define LIN_TASK_CALL_PERIOD_MS                   (50u)
@@ -88,9 +88,14 @@
 #include "cy_scb_uart.h"
 #include "cycfg_peripherals.h"
 
-/* LIN UART configured in Device Configurator on SCB10 for both TX and RX. */
-#define LIN_SCB_INSTANCE                          (SCB10)
-#define LIN_SCB_CONFIG                            (scb_10_config)
+/* LIN UART blocks configured in Device Configurator:
+ *   - SCB10 -> TX/header generation toward the actuator
+ *   - SCB6  -> RX/status capture from the actuator
+ */
+#define LIN_TX_SCB_INSTANCE                       (SCB10)
+#define LIN_TX_SCB_CONFIG                         (scb_10_config)
+#define LIN_RX_SCB_INSTANCE                       (SCB6)
+#define LIN_RX_SCB_CONFIG                         (scb_6_config)
 #endif
 
 /*******************************************************************************
@@ -127,7 +132,8 @@ typedef struct
  * Local Variables
  *******************************************************************************/
 #if !LIN_ACTUATOR_ENABLE_SIMULATION
-static cy_stc_scb_uart_context_t lin_uart_context;
+static cy_stc_scb_uart_context_t lin_tx_uart_context;
+static cy_stc_scb_uart_context_t lin_rx_uart_context;
 #endif
 static lin_actuator_context_t lin_ctx;
 
@@ -329,25 +335,24 @@ static void lin_send_command_frame(uint8_t raw_id, const uint8_t *data, size_t l
     checksum = lin_checksum_enhanced(pid, data, len);
 
     /* Clear FIFOs before a new frame exchange. */
-    Cy_SCB_ClearTxFifo(LIN_SCB_INSTANCE);
-    Cy_SCB_ClearRxFifo(LIN_SCB_INSTANCE);
+    Cy_SCB_ClearTxFifo(LIN_TX_SCB_INSTANCE);
 
     /* Send BREAK field. */
-    Cy_SCB_UART_SendBreakBlocking(LIN_SCB_INSTANCE, LIN_BREAK_BITS);
+    Cy_SCB_UART_SendBreakBlocking(LIN_TX_SCB_INSTANCE, LIN_BREAK_BITS);
     cyhal_system_delay_us(55);
 
     /* Send frame bytes. */
-    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, 0x55u);
-    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, pid);
+    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, 0x55u);
+    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, pid);
 
     for (i = 0u; i < len; i++)
     {
-        Cy_SCB_UART_Put(LIN_SCB_INSTANCE, data[i]);
+        Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, data[i]);
     }
 
-    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, checksum);
+    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, checksum);
 
-    while (Cy_SCB_UART_GetNumInTxFifo(LIN_SCB_INSTANCE) != 0u)
+    while (Cy_SCB_UART_GetNumInTxFifo(LIN_TX_SCB_INSTANCE) != 0u)
     {
     }
 
@@ -400,17 +405,16 @@ static void lin_send_header_request(uint8_t raw_id)
 {
     uint8_t pid = lin_protected_id(raw_id);
 
-    Cy_SCB_ClearTxFifo(LIN_SCB_INSTANCE);
-    Cy_SCB_ClearRxFifo(LIN_SCB_INSTANCE);
+    Cy_SCB_ClearTxFifo(LIN_TX_SCB_INSTANCE);
 
-    Cy_SCB_UART_SendBreakBlocking(LIN_SCB_INSTANCE, LIN_BREAK_BITS);
+    Cy_SCB_UART_SendBreakBlocking(LIN_TX_SCB_INSTANCE, LIN_BREAK_BITS);
     cyhal_system_delay_us(55);
 
-    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, 0x55u);
+    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, 0x55u);
     cyhal_system_delay_us(55);
-    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, pid);
+    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, pid);
 
-    while (Cy_SCB_UART_GetNumInTxFifo(LIN_SCB_INSTANCE) != 0u)
+    while (Cy_SCB_UART_GetNumInTxFifo(LIN_TX_SCB_INSTANCE) != 0u)
     {
     }
 
@@ -482,13 +486,13 @@ static bool lin_request_and_read_status(void)
     size_t rx_index = 0u;
     uint32_t rx_fifo_count;
 
-    Cy_SCB_ClearRxFifo(LIN_SCB_INSTANCE);
+    Cy_SCB_ClearRxFifo(LIN_RX_SCB_INSTANCE);
 
     cyhal_system_delay_ms(40);
     lin_send_header_request(LIN_STATUS_REQUEST_ID);
     cyhal_system_delay_ms(20);
 
-    rx_fifo_count = Cy_SCB_UART_GetNumInRxFifo(LIN_SCB_INSTANCE);
+    rx_fifo_count = Cy_SCB_UART_GetNumInRxFifo(LIN_RX_SCB_INSTANCE);
     printf("Info: LIN: RX FIFO count after status request = %lu\r\n", (unsigned long)rx_fifo_count);
 
     if (rx_fifo_count < LIN_STATUS_RESPONSE_LEN)
@@ -501,7 +505,7 @@ static bool lin_request_and_read_status(void)
 
     while (rx_index < LIN_STATUS_RESPONSE_LEN)
     {
-        lin_ctx.rx_data[rx_index] = (uint8_t)Cy_SCB_UART_Get(LIN_SCB_INSTANCE);
+        lin_ctx.rx_data[rx_index] = (uint8_t)Cy_SCB_UART_Get(LIN_RX_SCB_INSTANCE);
         rx_index++;
     }
 
@@ -759,7 +763,7 @@ static const char* lin_state_to_string(lin_actuator_state_t state)
  * Function Name: lin_actuator_init
  *******************************************************************************
  * Summary:
- *  Initializes the LIN actuator module and the SCB10 UART block.
+ *  Initializes the LIN actuator module and the LIN TX/RX UART blocks.
  *
  * Parameters:
  *  void
@@ -776,14 +780,23 @@ cy_rslt_t lin_actuator_init(void)
 #if !LIN_ACTUATOR_ENABLE_SIMULATION
     cy_rslt_t result;
 
-    result = Cy_SCB_UART_Init(LIN_SCB_INSTANCE, &LIN_SCB_CONFIG, &lin_uart_context);
+    result = Cy_SCB_UART_Init(LIN_TX_SCB_INSTANCE, &LIN_TX_SCB_CONFIG, &lin_tx_uart_context);
     if (result != CY_RSLT_SUCCESS)
     {
-        printf("Error: LIN: Failed to initialize SCB10 UART.\r\n");
+        printf("Error: LIN: Failed to initialize LIN TX UART (SCB10).\r\n");
         lin_ctx.state = LIN_ACTUATOR_STATE_ERROR;
         return result;
     }
-    Cy_SCB_UART_Enable(LIN_SCB_INSTANCE);
+    result = Cy_SCB_UART_Init(LIN_RX_SCB_INSTANCE, &LIN_RX_SCB_CONFIG, &lin_rx_uart_context);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        printf("Error: LIN: Failed to initialize LIN RX UART (SCB6).\r\n");
+        lin_ctx.state = LIN_ACTUATOR_STATE_ERROR;
+        return result;
+    }
+
+    Cy_SCB_UART_Enable(LIN_TX_SCB_INSTANCE);
+    Cy_SCB_UART_Enable(LIN_RX_SCB_INSTANCE);
 #endif
 
     lin_ctx.initialized = true;
@@ -814,6 +827,7 @@ cy_rslt_t lin_actuator_init(void)
  *******************************************************************************/
 void lin_actuator_task(void)
 {
+    __disable_irq();
     if (!lin_ctx.initialized)
     {
         return;
@@ -831,6 +845,8 @@ void lin_actuator_task(void)
     lin_ctx.elapsed_since_exchange_ms = 0u;
 
     lin_execute_state_machine_step();
+
+    __enable_irq();
 }
 
 /*******************************************************************************
