@@ -88,16 +88,17 @@
 #include "cy_scb_uart.h"
 #include "cycfg_peripherals.h"
 
-/* LIN UART blocks configured in Device Configurator:
- *   - SCB10 -> TX/header generation toward the actuator
- *   - SCB6  -> RX/status capture from the actuator
+/* LIN UART block configured in Device Configurator:
+ *   - SCB10 -> shared TX/RX UART used for actuator communication
  */
-#define LIN_TX_SCB_INSTANCE                       (SCB10)
-#define LIN_TX_SCB_CONFIG                         (scb_10_config)
-#define LIN_RX_SCB_INSTANCE                       (SCB6)
-#define LIN_RX_SCB_CONFIG                         (scb_6_config)
+#define LIN_SCB_INSTANCE                          (SCB10)
+#define LIN_SCB_CONFIG                            (scb_10_config)
 #endif
 
+
+    bool got_status;
+    bool closed_position_learned;
+    bool all_positions_learned;
 /*******************************************************************************
  * Local Types
  *******************************************************************************/
@@ -132,8 +133,7 @@ typedef struct
  * Local Variables
  *******************************************************************************/
 #if !LIN_ACTUATOR_ENABLE_SIMULATION
-static cy_stc_scb_uart_context_t lin_tx_uart_context;
-static cy_stc_scb_uart_context_t lin_rx_uart_context;
+static cy_stc_scb_uart_context_t lin_uart_context;
 #endif
 static lin_actuator_context_t lin_ctx;
 
@@ -176,6 +176,11 @@ static void lin_send_header_request(uint8_t raw_id);
  *******************************************************************************/
 static void lin_set_debug(const char *text)
 {
+    if (strncmp(lin_ctx.last_debug, text, sizeof(lin_ctx.last_debug)) == 0)
+    {
+        return;
+    }
+
     memset(lin_ctx.last_debug, 0, sizeof(lin_ctx.last_debug));
     snprintf(lin_ctx.last_debug, sizeof(lin_ctx.last_debug), "%s", text);
     printf("Info: LIN: %s\r\n", lin_ctx.last_debug);
@@ -198,13 +203,20 @@ static void lin_set_debug(const char *text)
 static void lin_set_debug_fmt(const char *fmt, ...)
 {
     va_list args;
-
-    memset(lin_ctx.last_debug, 0, sizeof(lin_ctx.last_debug));
+    char new_debug[LIN_DEBUG_TEXT_LEN];
 
     va_start(args, fmt);
-    vsnprintf(lin_ctx.last_debug, sizeof(lin_ctx.last_debug), fmt, args);
+    memset(new_debug, 0, sizeof(new_debug));
+    vsnprintf(new_debug, sizeof(new_debug), fmt, args);
     va_end(args);
 
+    if (strncmp(lin_ctx.last_debug, new_debug, sizeof(lin_ctx.last_debug)) == 0)
+    {
+        return;
+    }
+
+    memset(lin_ctx.last_debug, 0, sizeof(lin_ctx.last_debug));
+    snprintf(lin_ctx.last_debug, sizeof(lin_ctx.last_debug), "%s", new_debug);
     printf("Info: LIN: %s\r\n", lin_ctx.last_debug);
 }
 
@@ -335,24 +347,24 @@ static void lin_send_command_frame(uint8_t raw_id, const uint8_t *data, size_t l
     checksum = lin_checksum_enhanced(pid, data, len);
 
     /* Clear FIFOs before a new frame exchange. */
-    Cy_SCB_ClearTxFifo(LIN_TX_SCB_INSTANCE);
+    Cy_SCB_ClearTxFifo(LIN_SCB_INSTANCE);
 
     /* Send BREAK field. */
-    Cy_SCB_UART_SendBreakBlocking(LIN_TX_SCB_INSTANCE, LIN_BREAK_BITS);
+    Cy_SCB_UART_SendBreakBlocking(LIN_SCB_INSTANCE, LIN_BREAK_BITS);
     cyhal_system_delay_us(55);
 
     /* Send frame bytes. */
-    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, 0x55u);
-    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, pid);
+    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, 0x55u);
+    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, pid);
 
     for (i = 0u; i < len; i++)
     {
-        Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, data[i]);
+        Cy_SCB_UART_Put(LIN_SCB_INSTANCE, data[i]);
     }
 
-    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, checksum);
+    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, checksum);
 
-    while (Cy_SCB_UART_GetNumInTxFifo(LIN_TX_SCB_INSTANCE) != 0u)
+    while (Cy_SCB_UART_GetNumInTxFifo(LIN_SCB_INSTANCE) != 0u)
     {
     }
 
@@ -405,16 +417,16 @@ static void lin_send_header_request(uint8_t raw_id)
 {
     uint8_t pid = lin_protected_id(raw_id);
 
-    Cy_SCB_ClearTxFifo(LIN_TX_SCB_INSTANCE);
+    Cy_SCB_ClearTxFifo(LIN_SCB_INSTANCE);
 
-    Cy_SCB_UART_SendBreakBlocking(LIN_TX_SCB_INSTANCE, LIN_BREAK_BITS);
+    Cy_SCB_UART_SendBreakBlocking(LIN_SCB_INSTANCE, LIN_BREAK_BITS);
     cyhal_system_delay_us(55);
 
-    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, 0x55u);
+    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, 0x55u);
     cyhal_system_delay_us(55);
-    Cy_SCB_UART_Put(LIN_TX_SCB_INSTANCE, pid);
+    Cy_SCB_UART_Put(LIN_SCB_INSTANCE, pid);
 
-    while (Cy_SCB_UART_GetNumInTxFifo(LIN_TX_SCB_INSTANCE) != 0u)
+    while (Cy_SCB_UART_GetNumInTxFifo(LIN_SCB_INSTANCE) != 0u)
     {
     }
 
@@ -486,13 +498,13 @@ static bool lin_request_and_read_status(void)
     size_t rx_index = 0u;
     uint32_t rx_fifo_count;
 
-    Cy_SCB_ClearRxFifo(LIN_RX_SCB_INSTANCE);
+    Cy_SCB_ClearRxFifo(LIN_SCB_INSTANCE);
 
     cyhal_system_delay_ms(40);
     lin_send_header_request(LIN_STATUS_REQUEST_ID);
     cyhal_system_delay_ms(20);
 
-    rx_fifo_count = Cy_SCB_UART_GetNumInRxFifo(LIN_RX_SCB_INSTANCE);
+    rx_fifo_count = Cy_SCB_UART_GetNumInRxFifo(LIN_SCB_INSTANCE);
     printf("Info: LIN: RX FIFO count after status request = %lu\r\n", (unsigned long)rx_fifo_count);
 
     if (rx_fifo_count < LIN_STATUS_RESPONSE_LEN)
@@ -505,7 +517,7 @@ static bool lin_request_and_read_status(void)
 
     while (rx_index < LIN_STATUS_RESPONSE_LEN)
     {
-        lin_ctx.rx_data[rx_index] = (uint8_t)Cy_SCB_UART_Get(LIN_RX_SCB_INSTANCE);
+        lin_ctx.rx_data[rx_index] = (uint8_t)Cy_SCB_UART_Get(LIN_SCB_INSTANCE);
         rx_index++;
     }
 
@@ -646,9 +658,9 @@ static void lin_handle_pending_request(void)
  *******************************************************************************/
 static void lin_execute_state_machine_step(void)
 {
-    bool got_status;
-    bool closed_position_learned;
-    bool all_positions_learned;
+    // bool got_status;
+    // bool closed_position_learned;
+    // bool all_positions_learned;
 
     switch (lin_ctx.state)
     {
@@ -669,6 +681,10 @@ static void lin_execute_state_machine_step(void)
                     lin_ctx.state = LIN_ACTUATOR_STATE_CALIBRATING_TO_OPEN;
                     lin_set_debug("Closed position learned. Continuing calibration toward open.");
                 }
+                else
+                {
+                    lin_set_debug("Calibration in progress. Waiting for closed learned position.");
+                }
             }
             break;
 
@@ -685,6 +701,10 @@ static void lin_execute_state_machine_step(void)
                     lin_ctx.state = LIN_ACTUATOR_STATE_READY;
                     lin_set_debug("Calibration finished. All positions learned. Actuator is ready.");
                 }
+                else
+                {
+                    lin_set_debug("Calibration in progress. Waiting for all learned positions.");
+                }
             }
             break;
 
@@ -698,7 +718,12 @@ static void lin_execute_state_machine_step(void)
 
             lin_prepare_command(LIN_CALIBRATION_IDLE, lin_ctx.last_flap_command);
             lin_send_command_frame(LIN_COMMAND_ID, lin_ctx.tx_data, LIN_FRAME_DATA_LEN);
-            (void)lin_request_and_read_status();
+            got_status = lin_request_and_read_status();
+            if (got_status && lin_parse_expected_status(&closed_position_learned, &all_positions_learned))
+            {
+                lin_ctx.all_positions_learned = all_positions_learned;
+                lin_set_debug("Open command active. Actuator status received.");
+            }
             break;
 
         case LIN_ACTUATOR_STATE_CLOSING:
@@ -711,7 +736,12 @@ static void lin_execute_state_machine_step(void)
 
             lin_prepare_command(LIN_CALIBRATION_IDLE, lin_ctx.last_flap_command);
             lin_send_command_frame(LIN_COMMAND_ID, lin_ctx.tx_data, LIN_FRAME_DATA_LEN);
-            (void)lin_request_and_read_status();
+            got_status = lin_request_and_read_status();
+            if (got_status && lin_parse_expected_status(&closed_position_learned, &all_positions_learned))
+            {
+                lin_ctx.all_positions_learned = all_positions_learned;
+                lin_set_debug("Close command active. Actuator status received.");
+            }
             break;
 
         case LIN_ACTUATOR_STATE_ERROR:
@@ -763,7 +793,7 @@ static const char* lin_state_to_string(lin_actuator_state_t state)
  * Function Name: lin_actuator_init
  *******************************************************************************
  * Summary:
- *  Initializes the LIN actuator module and the LIN TX/RX UART blocks.
+ *  Initializes the LIN actuator module and the shared LIN UART block.
  *
  * Parameters:
  *  void
@@ -780,23 +810,15 @@ cy_rslt_t lin_actuator_init(void)
 #if !LIN_ACTUATOR_ENABLE_SIMULATION
     cy_rslt_t result;
 
-    result = Cy_SCB_UART_Init(LIN_TX_SCB_INSTANCE, &LIN_TX_SCB_CONFIG, &lin_tx_uart_context);
+    result = Cy_SCB_UART_Init(LIN_SCB_INSTANCE, &LIN_SCB_CONFIG, &lin_uart_context);
     if (result != CY_RSLT_SUCCESS)
     {
-        printf("Error: LIN: Failed to initialize LIN TX UART (SCB10).\r\n");
-        lin_ctx.state = LIN_ACTUATOR_STATE_ERROR;
-        return result;
-    }
-    result = Cy_SCB_UART_Init(LIN_RX_SCB_INSTANCE, &LIN_RX_SCB_CONFIG, &lin_rx_uart_context);
-    if (result != CY_RSLT_SUCCESS)
-    {
-        printf("Error: LIN: Failed to initialize LIN RX UART (SCB6).\r\n");
+        printf("Error: LIN: Failed to initialize shared LIN UART (SCB10).\r\n");
         lin_ctx.state = LIN_ACTUATOR_STATE_ERROR;
         return result;
     }
 
-    Cy_SCB_UART_Enable(LIN_TX_SCB_INSTANCE);
-    Cy_SCB_UART_Enable(LIN_RX_SCB_INSTANCE);
+    Cy_SCB_UART_Enable(LIN_SCB_INSTANCE);
 #endif
 
     lin_ctx.initialized = true;
