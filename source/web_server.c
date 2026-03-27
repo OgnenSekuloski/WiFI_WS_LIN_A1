@@ -150,10 +150,8 @@ static bool provisioning_button_enabled = false;
 /* True when GPIO interrupt for provisioning button is enabled. */
 static bool provisioning_button_irq_enabled = false;
 
-/* ISR-to-task signaling flags for provisioning button events. */
+/* ISR-to-task signaling flag for provisioning button press events. */
 static volatile bool provisioning_button_irq_pressed = false;
-static volatile bool provisioning_button_irq_released = false;
-static volatile bool provisioning_button_irq_is_pressed = false;
 static volatile bool provisioning_button_force_mode_requested = false;
 static cyhal_gpio_event_t provisioning_button_press_event = CYHAL_GPIO_IRQ_FALL;
 static cyhal_gpio_event_t provisioning_button_release_event = CYHAL_GPIO_IRQ_RISE;
@@ -395,14 +393,7 @@ static void provisioning_button_isr_callback(void *callback_arg, cyhal_gpio_even
 
     if ((event & provisioning_button_press_event) != 0u)
     {
-        provisioning_button_irq_is_pressed = true;
         provisioning_button_irq_pressed = true;
-    }
-
-    if ((event & provisioning_button_release_event) != 0u)
-    {
-        provisioning_button_irq_is_pressed = false;
-        provisioning_button_irq_released = true;
     }
 }
 
@@ -1723,10 +1714,7 @@ static void handle_runtime_force_provisioning(uint32_t loop_period_ms)
     }
 
     irq_pressed = provisioning_button_irq_pressed;
-    (void)provisioning_button_irq_is_pressed;
-
     provisioning_button_irq_pressed = false;
-    provisioning_button_irq_released = false;
 
     if (provisioning_button_irq_enabled)
     {
