@@ -1,6 +1,3 @@
-
-# WiFi_WS_LIN_A1
-
 ## Overview
 
 This project is my bachelor's thesis at the Faculty of Electrical Engineering and Information Technologies, UKIM in Skopje. It was suggested as a project from Magna Auteca. It implements a system for remote control and testing of a linear automotive actuator using a PSoC 6 microcontroller.
